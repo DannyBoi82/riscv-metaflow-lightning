@@ -1,0 +1,30 @@
+# Build / simulation outputs
+output/
+sweep_results/
+obj_dir/
+tools/refsim/riscv-refsim
+refdump.reg
+.riscv_sim_history
+
+# Test build artifacts (sources + .reg/.vh oracles are committed instead)
+tests/**/*.elf
+tests/**/*.bin
+tests/**/*.disassembly.s
+
+# Waveforms
+*.vcd
+*.fst
+*.fst.hier
+*.vpd
+
+# VCS litter
+csrc/
+simv*
+ucli.key
+DVEfiles/
+*.daidir/
+
+# Editor/OS noise
+*.swp
+*~
+.DS_Store
