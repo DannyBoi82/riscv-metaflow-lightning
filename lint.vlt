@@ -1,0 +1,58 @@
+`verilator_config
+// lint.vlt — waivers for `make lint` (verilator --lint-only -Wall).
+//
+// Policy: waive pre-existing noise so lint output stays actionable; keep
+// anything that could indicate a real functional or portability problem
+// visible. Every waiver is documented. See docs/porting-log.md.
+
+// ---------------------------------------------------------------------------
+// Style-only categories, waived globally. All pre-date the migration and are
+// harmless under both VCS and Verilator.
+// ---------------------------------------------------------------------------
+lint_off -rule UNUSEDSIGNAL
+lint_off -rule UNUSEDPARAM
+lint_off -rule IMPORTSTAR
+lint_off -rule VARHIDDEN
+lint_off -rule DECLFILENAME
+lint_off -rule EOFNEWLINE
+lint_off -rule PINCONNECTEMPTY
+
+// Width changes are well-defined and identical in VCS and Verilator; the
+// RTL relies on implicit extension/truncation throughout. Not a portability
+// risk, so waived to keep the signal-to-noise usable.
+lint_off -rule WIDTHEXPAND
+lint_off -rule WIDTHTRUNC
+
+// ---------------------------------------------------------------------------
+// Targeted waivers, each intentional
+// ---------------------------------------------------------------------------
+
+// tb/testbench.sv: the scheduled-release reset (rst_l <= #(...) 1) is the
+// intended 2-state-safe reset sequence; Verilator executes the intra-assign
+// delay as documented and the negedge/posedge ordering is what we want.
+lint_off -rule INITIALDLY -file "*/tb/testbench.sv"
+
+// rst_l feeds async resets in the core and sync logic in the tb; inherited
+// class-infrastructure design, same behavior under VCS.
+lint_off -rule SYNCASYNCNET -file "*/tb/testbench.sv"
+
+// Testbench-only blocking assigns in always_ff (cycle counter, $fopen fds);
+// class code, no cross-process readers.
+lint_off -rule BLKSEQ -file "*/tb/testbench.sv"
+lint_off -rule BLKSEQ -file "*/tb/register_file.sv"
+
+// tb: mem_data_stall output unused by the testbench (tied 0 inside).
+lint_off -rule PINMISSING -file "*/tb/testbench.sv"
+
+// NOTE (v5.048 quirk): -file/-match waivers did NOT take effect for the
+// PINMISSING / CASEWITHX / CASEINCOMPLETE warnings raised inside rtl/core
+// (only global rule-offs worked). Those three sites are waived with inline
+// `// verilator lint_off` metacomments in the RTL instead:
+//   rtl/core/riscv_core.sv:311 PINMISSING (unused decoder rd/rs1/rs2)
+//   rtl/core/lib.sv:210        CASEWITHX  (IMM_DC 4-state poison item)
+//   rtl/core/riscv_decode.sv   CASEINCOMPLETE (S-type funct3 subset)
+
+// SaneStateController retire_ready_vector: bit k reads bit k-1 — an acyclic
+// priority chain that Verilator's per-vector analysis flags as circular.
+// Converges in one relaxation pass; performance-only, not correctness.
+lint_off -rule UNOPTFLAT -file "*/rtl/ooo/SaneStateController.sv"
