@@ -350,3 +350,6 @@ Also masked all register-shift amounts to rs2[4:0] per ISA.
   now assemble and wait for hardware), C-test oracle regeneration for the
   local toolchain (the ~/lab4b-vl rig or — much faster — tools/refsim
   can produce them).
+- `make verify-trace` redesign (commit-state trace compare, replaces the
+  event-based class flow that choked on nop bubbles) — design + work
+  items in docs/TODO-verify-trace.md.
