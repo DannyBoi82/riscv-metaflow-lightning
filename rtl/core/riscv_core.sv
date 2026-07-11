@@ -25,8 +25,11 @@
 `include "riscv_isa.vh"
 `include "riscv_uarch.vh"
 `include "memory_segments.vh"
-`include "internal_defines.vh"
 `include "riscv_commit.vh"
+
+// Control/ALU/immediate types: must be imported per-file (VCS compiles
+// each file as a separate compilation unit; see rtl/core/lib.sv).
+import internal_defines_pkg::*;
 
 // Trace & perf are simulation-only. Comment out before synthesis / submission.
 //`define TRACE

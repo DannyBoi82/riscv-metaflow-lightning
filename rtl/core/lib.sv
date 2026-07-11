@@ -18,7 +18,11 @@
 
 `default_nettype none
 
-`include "internal_defines.vh"
+// Types (imm_mode_t, alu_op_t, ...) live in the internal_defines_pkg
+// package (rtl/core/0internal_defines_pkg.sv), so every file using them
+// must import it itself: VCS compiles each file as its own compilation
+// unit, so imports never leak across files like they do under Verilator.
+import internal_defines_pkg::*;
 
 /*--------------------------------------------------------------------------*
  * Combinational primitives                                                  *

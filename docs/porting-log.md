@@ -341,10 +341,10 @@ Also masked all register-shift amounts to rs2[4:0] per ISA.
   paths fixed (`make assemble`, runtime/ docs, REFSIM env override).
 - ~~README + CLAUDE.md + .gitignore~~ **done 07-07**; initial git commit
   pending final regression pass.
-- VCS parity run on an AFS machine (`make regress SIM=vcs`) — required to
-  bless the migration + the fifo/latch/reset RTL changes, **plus the 07-07
-  changes**: main_memory byte-lane fix, testbench watchdog, SSC generate-if
-  restructure, lint metacomments, rv32im test builds.
+- ~~VCS parity run (`make regress SIM=vcs`)~~ **done 07-11 on the lab
+  machine** (see the 07-11 section below): asm suite + verify-trace green
+  with CORE=inorder after three VCS-only fixes; C/perf leftovers are
+  toolchain residue + never-committed perf headers, not simulator deltas.
 - Future core work surfaced by the regression taxonomy: memory unit
   (D-side is tied off in riscv_core_interface.sv), M extension (mul tests
   now assemble and wait for hardware), C-test oracle regeneration for the
@@ -353,3 +353,70 @@ Also masked all register-shift amounts to rs2[4:0] per ISA.
 - `make verify-trace` redesign (commit-state trace compare, replaces the
   event-based class flow that choked on nop bubbles) — design + work
   items in docs/TODO-verify-trace.md.
+
+## 2026-07-11: VCS parity run (lab machine, VCS T-2022.06)
+
+First time the migrated harness met real VCS (previous work was WSL,
+Verilator-only). `make verify-trace CORE=inorder SIM=vcs` and
+`make regress TESTS='tests/asm/*.S' CORE=inorder SIM=vcs` are now green
+(the 3 mul tests fail as expected — no M hardware). Full
+`make regress CORE=inorder SIM=vcs`: same 3 mul failures, plus 6
+machine-environment failures that are not simulator deltas —
+dhrystone/kosarajus/spmv **don't compile** (their `#include`d headers
+`dhrystone.h`/`kosarajus_graph.h`/`spmv_matrix.h` were never committed;
+they must have sat untracked on the WSL box where full regress was
+green), and fft/mmmIntRV32I/mmmFpRV32I fail only in caller-saved a*/t*
+residue (the documented class-toolchain-coupled oracle issue — this
+box's RISC-V GCC differs from the one that matched). Three latent bugs,
+all masked by Verilator and exposed by VCS:
+
+### Compilation-unit imports (build break)
+
+`rtl/core/lib.sv` and `rtl/core/riscv_core.sv` used `internal_defines_pkg`
+types (`imm_mode_t`, `ALU_*`, ...) without importing the package — they
+`include`d `internal_defines.vh`, which is a commented-out stub (the real
+definitions moved to `rtl/core/0internal_defines_pkg.sv` long ago).
+Verilator treats **all sources as one compilation unit**, so the file-scope
+`import internal_defines_pkg::*;` in other files (riscv_decode.sv etc.)
+leaked into $unit and resolved the types. VCS compiles **one compilation
+unit per file** (and even `-mfcu` is order-sensitive), so it errored with
+"Identifier not declared". Fix: per-file `import internal_defines_pkg::*;`
+in both files. Rule going forward: every file that uses package types
+imports the package itself; never rely on another file's import.
+
+### main_memory seg_mem: always_ff vs initial-block init (Error-[ICPD])
+
+VCS rejects an `always_ff` variable written by any other process;
+`seg_mem` is initialized (0xDE poison + file load) in an `initial` block.
+Verilator doesn't enforce single-driver on always_ff. Fix: the store
+process is a plain `always @(posedge clk)` with a comment.
+
+### delay_buffer reset never fires → X-poisoned `halted` duplicates a commit
+
+The testbench reset waveform is `1 → (t=1) 0 → (t=HALF_PERIOD) 1` and the
+clock starts at 1 with posedges at t=0, 2H, 4H... — so **no clock posedge
+ever samples rst_l low**, and any synchronous-reset-only state is never
+reset. All design flops use async `negedge rst_l` (fires at t=1) and were
+fine; the tb `delay_buffer` (memory-latency model) used a synchronous
+reset. Under 2-state Verilator its `data_q` starts at 0 = RESET_VAL, so
+nothing was ever visibly wrong. Under VCS it shipped X for the first
+DELAY cycles — including the `mem_excpt` bit, so `exception_halt` →
+`halted` was X for cycles 1..8. `pc_F1`'s enable (`~halted && ...`)
+evaluated X → PC register froze, while the F1→F2 latch (not gated by
+halted) marked F2 valid anyway: pc 0x400000 entered the pipe twice and
+**the first instruction committed twice**. `make verify` still passed
+(the duplicated addi is architecturally idempotent) — it was
+`verify-trace` that caught it, at exactly commit #2, which is the tool
+working as designed. Fix: delay_buffer (and the tb `mem_access` counter)
+now use async resets like the rest of the design; zero behavior change
+under Verilator. Rule going forward: no synchronous-reset-only state
+anywhere — the reset window contains no clock edge by design.
+
+### Environment notes (lab machine)
+
+- VCS: T-2022.06 via AFS (`/afs/ece.cmu.edu/support/synopsys/...`).
+- No working Verilator here yet: the config.mk-pinned
+  `~/.local/bin/verilator` (custom v5.048 -O1 build) is on the old WSL
+  box, and conda's verilator 5.046 dies with "Verilator internal fault"
+  on this design (same species as the documented GCC-miscompile
+  segfaults — needs a -O1 rebuild if Verilator is wanted here).

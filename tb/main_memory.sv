@@ -145,8 +145,11 @@ module main_memory
         end
     end
 
-    // Handle writing to memory, merging in bytes as per the write mask
-    always_ff @(posedge clk) begin
+    /* Handle writing to memory, merging in bytes as per the write mask.
+     * Plain `always` rather than `always_ff`: seg_mem is also written by
+     * the initialization `initial` block below, and VCS rejects any
+     * always_ff variable driven by another process (Error-[ICPD]). */
+    always @(posedge clk) begin
         data_store_loop: for (int i = 0; i < NUM_PORTS; i++) begin
             if (rst_l && segment_indices[i].valid &&
                     (store_masks[i] != '0)) begin

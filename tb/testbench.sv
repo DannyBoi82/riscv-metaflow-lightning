@@ -166,7 +166,8 @@ module top;
     end
     // check number of memory cycles
     logic [63:0] mem_access;
-    always_ff @(posedge clk) begin
+    // Async reset: no posedge falls inside the reset window (see delay_buffer)
+    always_ff @(posedge clk, negedge rst_l) begin
         if (!rst_l) begin
             mem_access <= '0;
         end
@@ -264,7 +265,13 @@ module delay_buffer #(parameter DATA_WIDTH=0, DELAY=0, RESET_VAL=0)
 
     integer       i;
 
-    always@(posedge clk) begin
+    /* Reset must be asynchronous: rst_l is only low between t=1 and the
+     * first clock edge (see the reset initial block), so no posedge ever
+     * samples it low and a synchronous reset would never fire. Verilator's
+     * 2-state zero-init masked that; under VCS data_q shipped X for the
+     * first DELAY cycles, X-poisoning mem_excpt (and through it `halted`,
+     * which duplicated the first fetch — caught by verify-trace). */
+    always@(posedge clk, negedge rst_l) begin
         if (!rst_l) begin
             for (i = 0; i < DELAY; i=i+1) begin
                 data_q[i]<=RESET_VAL;

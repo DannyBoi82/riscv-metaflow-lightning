@@ -195,9 +195,20 @@ both sides agree that the dump point is "one committed instruction."
 - [ ] lightning: SSC must carry pc/insn and non-writing retirements into
       reg_commits so verify-trace works on CORE=lightning (write-only
       packets today; see TODO(SSC) in LightningCore.sv).
-- [ ] VCS parity: verify-trace flow has only been run under Verilator;
-      exercise it in the next AFS run (tb is single-SV-top and uses only
-      $fopen/$fwrite/plusargs, so no VCS-specific code expected).
+- [x] VCS parity (*done 07-11 on the lab machine*): verify-trace green under
+      `SIM=vcs` (additest, memtest0-2, depend, brtest0/2, syscalltest;
+      asm regress matches Verilator: all pass except the 3 mul tests).
+      Three latent issues surfaced, all Verilator-masked (fixes in
+      porting-log "07-11: VCS parity"): missing per-file
+      `import internal_defines_pkg::*` in lib.sv/riscv_core.sv (Verilator
+      compiles all files as one compilation unit, VCS one per file);
+      main_memory seg_mem always_ff vs initial-block init (VCS ICPD);
+      delay_buffer synchronous reset that never fires (no clock edge
+      inside the reset window) shipping X into mem_excpt → `halted` for
+      the first DELAY cycles, which froze pc_F1 while F2 self-validated
+      and **duplicated the first instruction's commit — found by
+      verify-trace itself** (end-state verify still passed; the dup addi
+      was idempotent).
 
 ## Scope / non-goals
 
