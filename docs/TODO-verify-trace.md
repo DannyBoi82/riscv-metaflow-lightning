@@ -1,5 +1,14 @@
 # TODO — verify-trace redesign (commit-state trace compare)
 
+**Status 2026-07-11 (end of day): LANDED and blessed on CORE=inorder.**
+`make verify-trace TEST=... CORE=inorder` works end-to-end: full asm suite
+passes (17 representative tests trace-verified incl. memtest0-2/depend;
+full regress green except the 3 expected mul tests), and an injected ALU
+fault was pinpointed to the exact commit/pc/insn/register. Old
+TRACE=1/DEBUG_RFWRTRACE machinery and the 64 class `.vh` oracles deleted.
+Remaining items are marked open below; usage docs live in README
+("verify-trace"), file map in docs/architecture.md.
+
 ## Why
 
 The class `make verify-trace` compared register **write events** (the
@@ -68,7 +77,32 @@ both sides agree that the dump point is "one committed instruction."
   Shape the field names as an RVFI subset (`rvfi_order`, `rvfi_pc_rdata`,
   `rvfi_rd_addr`, `rvfi_rd_wdata`...) — RVFI is the industry codification
   of exactly this idea, and matching it keeps the door open for
-  riscv-formal / Spike co-sim later. The regfile stays dumb.
+  riscv-formal / Spike co-sim later.
+- **Who assembles the packets** (*decided 07-11*): `tb/register_file.sv`
+  becomes a pure packet assembler — the core tells it which slots retire a
+  real instruction (`commit_valid`/`commit_pc`/`commit_insn`) and its own
+  write-port inputs supply the register-write half; it then just passes
+  `commit_pkts` up to the testbench. All dump/trace/checking machinery
+  leaves the regfile. **Using this module is optional, and the contract
+  must be documented (README + riscv_commit.vh)**: a design with an
+  architectural-vs-physical register file split has no regfile module that
+  ever sees architectural commits, so such a core emits `commit_pkt_t`
+  packets itself at its retirement point — the harness only ever consumes
+  the packets. (Future-proofing; both current cores do use the module.)
+- **End-state dump follows the packets** (*decided 07-11*): the
+  end-of-run `simulation.reg` dump is printed by the tb verifier from its
+  shadow regfile, not by the design — packets are the sole
+  design-to-harness channel (a PRF design has no flop array to dump
+  anyway). Consequence: `make verify` now also depends on faithful commit
+  reporting; the shadow-vs-flops cross-check below is the guard.
+- **Bring-up core** (*decided 07-11*): develop and bless the whole flow on
+  the **in-order class core** (`CORE=inorder`, `rtl/core/riscv_core.sv` +
+  `rtl/mem/riscv_core_interface_inorder.sv`, vendored from the old class
+  seam) — it passes the full autograder suite, so flow bugs are never
+  confused with Lightning bugs. Lightning meanwhile emits *write-only*
+  packets (valid on register-writing retirements, pc/insn = 0) so its
+  end-state verify keeps working; full verify-trace on Lightning is
+  blocked on the SSC carrying pc/insn and non-writing retirements.
 - **tb-side verifier module** consumes the packets, keeps a shadow
   architectural regfile, applies writes **slot-serialized in program
   order**, and prints one full state line per commit. This reconstructs
@@ -98,11 +132,9 @@ both sides agree that the dump point is "one committed instruction."
 
 ## Work items
 
-- [ ] refsim: new per-commit full-state trace mode, hooked in the step
-      loop (the existing `trace` command prints write events from
-      `register_write` — leave it alone, the recovered class flow uses
-      it; add the new mode alongside). Makefile plumbing:
-      `make reftrace TEST=...`.
+- [x] refsim: `statetrace (file)?` command (anchor line on activation,
+      one line per instruction from `run_simulator()`; the old `trace`
+      command untouched). `make reftrace TEST=...` pipes it in.
 - [ ] shadow-vs-flops cross-check: the verifier's shadow regfile is
       built from commit packets — if the real regfile flops diverge
       from what the packets claim (write-decode bug landing in the
@@ -112,30 +144,60 @@ both sides agree that the dump point is "one committed instruction."
       (hierarchical ref, same precedent as `top.mem_access`). The class
       scheme has the same hole (it checks write-port values, not stored
       state).
-- [ ] commit_pkt_t + emission at the retirement seam (SSC/LightningCore),
-      simulation-only consumer; keep the tb single-SV-top valid for both
-      Verilator and VCS.
-- [ ] tb verifier module: shadow regfile, slot-serialized state lines,
-      cycle annotation, initial anchor line.
-- [ ] checker (scripts/): field-wise compare ignoring `#` comments;
-      first-divergence report (commit idx, pc, insn, regs, cycle).
-- [ ] `make verify-trace TEST=...`: reftrace + RTL trace + checker.
-- [ ] pretty-print viewer script for compact lines (short tests).
-- [ ] delete superseded DEBUG_RFWRTRACE / reg_defs.vh machinery and the
-      class .vh trace oracles once the new flow is green. Nothing
-      irrecoverable is lost: the class scripts are vendored in
-      stuff-from-ece447-folder/ (keep them) and the in-repo refsim has
-      the same `trace` command, so the whole old flow is reproducible
-      locally — new-repo.md's "not regenerable without class scripts"
-      note is obsolete.
+- [x] commit_pkt_t (`rtl/include/riscv_commit.vh`, RVFI-style fields,
+      COMMIT_WAYS_MAX padding) + regfile converted to packet assembler.
+- [x] in-order core commit plumbing: valid_F2..valid_W chain (bubbles and
+      the mispredict M1→M2 double-latch marked invalid), pc/insn carried
+      to W, `commit_fire = valid_W & ~stall_W`, packets out through a
+      SIMULATION_18447-guarded port. `CORE={lightning,inorder}` selection
+      in config.mk/Makefile (both wrappers define riscv_core_interface;
+      exactly one is compiled).
+- [x] inorder wrapper: commit_pkts plumbed up to the testbench (padded to
+      COMMIT_WAYS_MAX); lightning wrapper likewise.
+- [x] lightning: rf commit tie-off switched from '0 to write-only packets
+      (commit_valid = write-port we) so the shadow-based end-state dump
+      stays correct on CORE=lightning.
+- [x] tb verifier module (tb/commit_verifier.sv): shadow regfile,
+      slot-serialized state lines gated by a `+commit_trace` plusarg,
+      `#cycle=N insn=X` annotation, initial anchor line, end-of-run
+      simulation.reg dump from the shadow (took over the regfile's dump
+      duty) — computed through a blocking temp so halt-edge commits are
+      included (the old flop-read dump raced same-edge writes).
+- [x] halting ecall (*decided 07-11*): produces a final trace line on
+      both sides — refsim's step loop executes it anyway, so the RTL
+      forces the last commit on the halt edge even if stall_W is high
+      (`valid_W & (~stall_W | halted)`).
+- [x] checker (scripts/check_commit_trace.py): field-wise compare
+      ignoring `#` comments; first-divergence report (commit idx, pc,
+      insn, regs w/ ABI names, RTL cycle); length-mismatch diagnosis.
+      Proven against an injected ALU fault (exact commit identified).
+- [x] `make verify-trace TEST=...`: reftrace + RTL sim (+commit_trace via
+      the new PLUSARGS= knob) + checker.
+- [x] pretty-print viewer: scripts/view_commit_trace.py (per-commit
+      register deltas; --full for whole-state dumps).
+- [x] deleted superseded TRACE=1 / DEBUG_RFWRTRACE / reg_defs.vh Makefile
+      machinery and the 64 class .vh trace oracles. Nothing irrecoverable:
+      git history has the .vh files and the old register_file.sv
+      (`git show 00c8ebb:tb/register_file.sv`), class scripts are vendored
+      in stuff-from-ece447-folder/, and the in-repo refsim keeps the
+      `trace` command, so the whole old flow is reproducible.
 - [ ] split config spaces: tb/ISA parameters (XLEN, superscalar/retire
       ways as the harness sees them, memory latency, RISCV_ARCH) vs
       design parameters (LTG_* stays the design's own space). Retarget
       the first for a different RISC-V flavor; the second only for
       Lightning-specific knobs.
-- [ ] README: verify-trace usage + the cost note above.
-- [ ] sanity cross-check: final trace line state must equal the
-      end-of-run simulation.reg dump.
+- [x] README: verify-trace usage, the cost note, and the commit packet
+      contract (how a design that doesn't use tb/register_file.sv hooks
+      in by emitting commit_pkt_t packets itself).
+- [x] sanity cross-check "final trace line == end-of-run dump": true by
+      construction now — both are produced from the same shadow state in
+      commit_verifier.
+- [ ] lightning: SSC must carry pc/insn and non-writing retirements into
+      reg_commits so verify-trace works on CORE=lightning (write-only
+      packets today; see TODO(SSC) in LightningCore.sv).
+- [ ] VCS parity: verify-trace flow has only been run under Verilator;
+      exercise it in the next AFS run (tb is single-SV-top and uses only
+      $fopen/$fwrite/plusargs, so no VCS-specific code expected).
 
 ## Scope / non-goals
 

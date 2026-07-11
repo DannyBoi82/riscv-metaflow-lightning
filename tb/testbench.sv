@@ -37,6 +37,7 @@
 `include "riscv_isa.vh"             // Definition of XLEN
 `include "riscv_uarch.vh"           // Definition of main memory parameters
 `include "memory_segments.vh"       // Definition of memory segments array
+`include "riscv_commit.vh"          // Commit packet definition (verify-trace)
 
 /*----------------------------------------------------------------------------
  * Simulation Top Module
@@ -78,6 +79,9 @@ module top;
     logic [MEMORY_READ_WIDTH-1:0][XLEN-1:0] mem_data_load_M, mem_load_data;
     logic mem_resp_valid;
 
+    // Commit packets emitted by the core at retirement (verify-trace)
+    RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0] commit_pkts;
+
     /* Handle resetting the processor when simulation begins. Start rst_l
      * high and drop it after one time unit so `negedge rst_l` fires in
      * 2-state simulation as well: in 4-state simulators the X->0 transition
@@ -106,7 +110,18 @@ module top;
         .halted              (halted),
         .mem_data_store_mask (mem_store_mask),
         .mem_data_store      (mem_store_data),
-        .mem_data_load_addr  (mem_resp_addr)
+        .mem_data_load_addr  (mem_resp_addr),
+        .commit_pkts         (commit_pkts)
+    );
+
+    /* Consumes the commit packet stream: shadow architectural regfile,
+     * optional per-commit state trace (+commit_trace), and the end-of-run
+     * register dump. See tb/commit_verifier.sv. */
+    commit_verifier CommitVerifier (
+        .clk,
+        .rst_l,
+        .halted,
+        .commit_pkts
     );
 
     // Delay buffer to simulate multi-cycle pipelined memory

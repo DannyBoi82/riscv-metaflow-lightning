@@ -141,6 +141,16 @@ void command_verbose(cpu_state_t *cpu_state, char *args[], int num_args);
 void command_trace(cpu_state_t *cpu_state, char *args[], int num_args);
 
 /**
+ * Toggles per-commit full-state tracing mode for the simulator.
+ *
+ * While active, one compact line of full architectural register state is
+ * written per executed instruction (plus an initial anchor line) to the file
+ * given as the optional argument (default "statetrace.txt"). This is the
+ * verify-trace format that RTL commit traces are diffed against.
+ **/
+void command_statetrace(cpu_state_t *cpu_state, char *args[], int num_args);
+
+/**
  * Quits the simulator.
  **/
 bool command_quit(cpu_state_t *cpu_state, char *args[], int num_args);

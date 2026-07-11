@@ -23,8 +23,10 @@
 
 `include "riscv_abi.vh"
 `include "riscv_isa.vh"
+`include "riscv_uarch.vh"
 `include "memory_segments.vh"
 `include "internal_defines.vh"
+`include "riscv_commit.vh"
 
 // Trace & perf are simulation-only. Comment out before synthesis / submission.
 //`define TRACE
@@ -63,11 +65,27 @@ module riscv_core
      output logic           instr_stall, data_stall,
      output logic [31:0]    data_store,
      output logic           correct_branch_prediction,
-     output logic           flushing);
+     output logic           flushing
+`ifdef SIMULATION_18447
+     /* Commit packets for the verify-trace flow (see riscv_commit.vh).
+      * Simulation-only so synthesis keeps its original interface; the
+      * commit plumbing below is dead logic there and gets pruned. */
+     ,
+     output RISCV_Commit::commit_pkt_t [RISCV_UArch::SUPERSCALAR_WAYS-1:0]
+                            commit_pkts
+`endif
+     );
 
     import RISCV_ISA::*;
     import RISCV_ABI::ECALL_ARG_HALT;
     import MemorySegments::USER_TEXT_START;
+    import RISCV_UArch::SUPERSCALAR_WAYS;
+
+`ifndef SIMULATION_18447
+    // Off-simulation stand-in for the ifdef'd port so the commit logic
+    // below always elaborates (and then prunes) the same way.
+    RISCV_Commit::commit_pkt_t [SUPERSCALAR_WAYS-1:0] commit_pkts;
+`endif
 
     // ====================================================================
     // Pipeline signal declarations (live signals only; debug-only signals
@@ -159,9 +177,26 @@ module riscv_core
     // ====================================================================
     // Debug-only signals (TRACE / PERF). Synthesized away when both undef.
     // ====================================================================
+    // ---------- Commit plumbing (always compiled) ----------
+    // Instruction word, PC, and real-instruction valid bit carried to W for
+    // commit packet emission (verify-trace). valid_* is set for fetched
+    // program instructions and cleared wherever the pipeline manufactures a
+    // bubble or a stage holds a stale copy, so exactly one commit fires per
+    // architecturally retired instruction. Also used by TRACE/PERF.
+    logic [31:0] instr_E, instr_M1, instr_M2, instr_W;
+    logic [31:0] pc_M2, pc_W;
+    logic        valid_F2, valid_F3, valid_D, valid_E,
+                 valid_M1, valid_M2, valid_W;
+
+    // Commit inputs to the register file. This core retires one instruction
+    // per cycle, so only slot 0 is ever used; the regfile stays at its
+    // default SUPERSCALAR_WAYS width.
+    logic        commit_fire;
+    logic [SUPERSCALAR_WAYS-1:0]        rf_commit_valid;
+    logic [SUPERSCALAR_WAYS-1:0][31:0]  rf_commit_pc, rf_commit_insn;
+
     `ifdef DEBUG_PIPELINE
         // Used by TRACE ($display) and PERF (counters).
-        logic [31:0] instr_E, instr_M1, instr_M2, instr_W;
         logic [31:0] se_immediate_M1, se_immediate_M2, se_immediate_W;
     `endif
 
@@ -171,11 +206,6 @@ module riscv_core
         logic        tempstall_E, tempstall_M1, tempstall_M2, tempstall_W;
         logic        hit_F2, hit_F3, hit_D, hit_E, hit_M1, hit_M2, hit_W;
         logic        taken_branch_M2, taken_branch_W;
-    `endif
-
-    `ifdef TRACE
-        // Only the $display block reads pc_W; pc_M2 is its propagation hop.
-        logic [31:0] pc_M2, pc_W;
     `endif
 
     // ====================================================================
@@ -227,12 +257,15 @@ module riscv_core
         if (~rst_l) begin
             pc_F2        <= 32'd0;
             npc_plus4_F2 <= {28'd0, pc_mispredict_flush};
+            valid_F2     <= 1'b0;
         end
         else if (~correct_branch_prediction) begin
             pc_F2        <= {28'd0, pc_mispredict_flush};
             npc_plus4_F2 <= {28'd0, pc_mispredict_flush};
+            valid_F2     <= 1'b0;
         end
         else if (~stall_F2) begin
+            valid_F2              <= 1'b1;   // F1 always holds a real PC
             pc_F2                 <= pc_F1;
             npc_plus4_F2          <= npc_plus4_F1;
             btb_hist_F2           <= btb_hist_F1;
@@ -250,18 +283,22 @@ module riscv_core
         if (~rst_l) begin
             pc_F3        <= 32'd0;
             npc_plus4_F3 <= {28'd0, pc_mispredict_flush};
+            valid_F3     <= 1'b0;
         end
         else if (~correct_branch_prediction) begin
             pc_F3        <= {28'd0, pc_mispredict_flush};
             npc_plus4_F3 <= {28'd0, pc_mispredict_flush};
+            valid_F3     <= 1'b0;
         end
         else if (~stall_F3 & stall_F2) begin
             // F3 is draining but F2 is frozen. Insert a bubble in F3 so the
             // same instruction doesn't get re-latched from the live F2 reg.
             pc_F3        <= {28'd0, pc_stall_bubble};
             npc_plus4_F3 <= {28'd0, pc_stall_bubble};
+            valid_F3     <= 1'b0;
         end
         else if (~stall_F3) begin
+            valid_F3              <= valid_F2;
             pc_F3                 <= pc_F2;
             npc_plus4_F3          <= npc_plus4_F2;
             btb_hist_F3           <= btb_hist_F2;
@@ -285,12 +322,15 @@ module riscv_core
         if (~rst_l) begin
             pc_D    <= 32'd0;
             instr_D <= 32'h00000013;
+            valid_D <= 1'b0;
         end
         else if (~correct_branch_prediction) begin
             pc_D    <= {28'd0, pc_mispredict_flush};
             instr_D <= 32'h00000013;
+            valid_D <= 1'b0;
         end
         else if (~stall_D) begin
+            valid_D              <= valid_F3;
             pc_D                 <= pc_F3;
             npc_plus4_D          <= npc_plus4_F3;
             instr_D              <= instr_F3;
@@ -328,27 +368,36 @@ module riscv_core
     assign rd_D  = instr_D[11:7];
 
     register_file #(.FORWARD(1)) rf (
-        .clk, .rst_l, .halted,
-        .rd_we    (ctrl_signals_W.rfWrite),
-        .rs1      (rs1_D),
-        .rs2      (rs2_D),
-        .rd       (rd_W),
-        .rd_data  (rd_data_W),
-        .rs1_data (rs1_data_D),
-        .rs2_data (rs2_data_D));
+        .clk, .rst_l,
+        .rd_we        (ctrl_signals_W.rfWrite),
+        .rs1          (rs1_D),
+        .rs2          (rs2_D),
+        .rd           (rd_W),
+        .rd_data      (rd_data_W),
+        .commit_valid (rf_commit_valid),
+        .commit_pc    (rf_commit_pc),
+        .commit_insn  (rf_commit_insn),
+        .rs1_data     (rs1_data_D),
+        .rs2_data     (rs2_data_D),
+        .commit_pkts  (commit_pkts));
 
     // ====================================================================
     // D -> E  (execute register)
     // ====================================================================
     always_ff @(posedge clk, negedge rst_l) begin: IDtoEX
-        if (~rst_l)
+        if (~rst_l) begin
             ctrl_signals_E <= CTRL_SIGNALS_NOOP;
+            valid_E        <= 1'b0;
+        end
         else if (~correct_branch_prediction) begin
             pc_E           <= {28'd0, pc_mispredict_flush};
             npc_plus4_E    <= {28'd0, pc_mispredict_flush};
             ctrl_signals_E <= CTRL_SIGNALS_NOOP;
+            valid_E        <= 1'b0;
         end
         else if (~stall_D) begin
+            valid_E              <= valid_D;
+            instr_E              <= instr_D_mux;
             pc_E                 <= pc_D;
             npc_plus4_E          <= npc_plus4_D;
             ctrl_signals_E       <= ctrl_signals_D;
@@ -359,9 +408,6 @@ module riscv_core
             btb_hist_E           <= btb_hist_D;
             predicted_next_pc_E  <= predicted_next_pc_D;
 
-            `ifdef DEBUG_PIPELINE
-                instr_E <= instr_D_mux;
-            `endif
             `ifdef PERF
                 rs1_E       <= rs1_D;
                 tempstall_E <= stall_D;
@@ -371,6 +417,7 @@ module riscv_core
         else if (stall_D & ~EMW_stall) begin
             // FD-stall (load-use): inject a bubble into E.
             ctrl_signals_E <= CTRL_SIGNALS_NOOP;
+            valid_E        <= 1'b0;
         end
     end
 
@@ -415,9 +462,13 @@ module riscv_core
     // E -> M1  (memory register stage 1)
     // ====================================================================
     always_ff @(posedge clk, negedge rst_l) begin: EXtoMEM1
-        if (~rst_l)
+        if (~rst_l) begin
             ctrl_signals_M1 <= CTRL_SIGNALS_NOOP;
+            valid_M1        <= 1'b0;
+        end
         else if (~stall_M1 & correct_branch_prediction) begin
+            valid_M1              <= valid_E;
+            instr_M1              <= instr_E;
             pc_M1                 <= pc_E;
             npc_plus4_M1          <= npc_plus4_E;
             npc_offset_M1         <= npc_offset_E;
@@ -431,7 +482,6 @@ module riscv_core
             predicted_next_pc_M1  <= predicted_next_pc_E;
 
             `ifdef DEBUG_PIPELINE
-                instr_M1         <= instr_E;
                 se_immediate_M1  <= se_immediate_E;
             `endif
             `ifdef PERF
@@ -439,6 +489,15 @@ module riscv_core
                 tempstall_M1 <= tempstall_E;
                 hit_M1       <= hit_E;
             `endif
+        end
+        else if (~stall_M2) begin
+            /* Mispredict-resolution cycle: M2 latched M1's instruction on
+             * this edge but M1 did not refill (the enable above is gated by
+             * correct_branch_prediction), so M1 now holds a stale copy of
+             * the mispredicted control-flow op and will feed it to M2 a
+             * second time next cycle. Architecturally invisible (same data
+             * rewritten), but it must not commit twice. */
+            valid_M1 <= 1'b0;
         end
     end
 
@@ -468,16 +527,20 @@ module riscv_core
     // M1 -> M2  (memory register stage 2)
     // ====================================================================
     always_ff @(posedge clk, negedge rst_l) begin: MEM1toMEM2
-        if (~rst_l)
+        if (~rst_l) begin
             ctrl_signals_M2 <= CTRL_SIGNALS_NOOP;
+            valid_M2        <= 1'b0;
+        end
         else if (~stall_M2) begin
+            valid_M2        <= valid_M1;
+            instr_M2        <= instr_M1;
+            pc_M2           <= pc_M1;
             ctrl_signals_M2 <= ctrl_signals_M1;
             rs1_data_M2     <= rs1_data_M1;
             alu_out_M2      <= alu_out_M1;
             rd_M2           <= rd_M1;
 
             `ifdef DEBUG_PIPELINE
-                instr_M2         <= instr_M1;
                 se_immediate_M2  <= se_immediate_M1;
             `endif
             `ifdef PERF
@@ -485,9 +548,6 @@ module riscv_core
                 tempstall_M2    <= stall_M1;
                 hit_M2          <= hit_M1;
                 taken_branch_M2 <= taken_branch_M1;
-            `endif
-            `ifdef TRACE
-                pc_M2 <= pc_M1;
             `endif
         end
     end
@@ -499,16 +559,20 @@ module riscv_core
     // M2 -> W  (writeback register)
     // ====================================================================
     always_ff @(posedge clk, negedge rst_l) begin: MEM2toWB
-        if (~rst_l)
+        if (~rst_l) begin
             ctrl_signals_W <= CTRL_SIGNALS_NOOP;
+            valid_W        <= 1'b0;
+        end
         else if (~stall_W) begin
+            valid_W        <= valid_M2;
+            instr_W        <= instr_M2;
+            pc_W           <= pc_M2;
             ctrl_signals_W <= ctrl_signals_M2;
             rs1_data_W     <= rs1_data_M2;
             alu_out_W      <= alu_out_M2;
             rd_W           <= rd_M2;
 
             `ifdef DEBUG_PIPELINE
-                instr_W         <= instr_M2;
                 se_immediate_W  <= se_immediate_M2;
             `endif
             `ifdef PERF
@@ -516,9 +580,6 @@ module riscv_core
                 tempstall_W    <= stall_M2;
                 hit_W          <= hit_M2;
                 taken_branch_W <= taken_branch_M2;
-            `endif
-            `ifdef TRACE
-                pc_W <= pc_M2;
             `endif
         end
     end
@@ -535,6 +596,28 @@ module riscv_core
         .data_load    (data_load_W),
         .alu_out      (alu_out_W),
         .rd_data      (rd_data_W));
+
+    // ====================================================================
+    // COMMIT (verify-trace seam): the instruction in W retires on the clock
+    // edge where W refills (~stall_W) — the same edge its regfile write
+    // lands, so the sampled packet and the write are always consistent. The
+    // valid chain guarantees exactly one packet per architecturally retired
+    // instruction (no bubbles, no stale mispredict copies). The halting
+    // instruction commits on the halt edge even if stall_W is high (a
+    // younger memory op can hold EMW_stall): the refsim's step loop
+    // executes the halting ecall, so both traces must end with its line —
+    // and simulation $finishes on that edge, so it can't fire twice.
+    // ====================================================================
+    assign commit_fire = valid_W & (~stall_W | halted);
+
+    always_comb begin
+        rf_commit_valid    = '0;
+        rf_commit_pc       = '0;
+        rf_commit_insn     = '0;
+        rf_commit_valid[0] = commit_fire;
+        rf_commit_pc[0]    = pc_W;
+        rf_commit_insn[0]  = instr_W;
+    end
 
     // ====================================================================
     // STALL & FLUSH CONTROL

@@ -1,12 +1,13 @@
 // RISC-V Includes
 `include "riscv_abi.vh"
 `include "riscv_isa.vh"
+`include "riscv_uarch.vh"
 `include "memory_segments.vh"
+`include "riscv_commit.vh"
 
 // Local Includes
-import internal_defines_pkg::*;
+`include "internal_defines.vh"
 `include "parameters.vh"
-`include "riscv_commit.vh"
 
 `default_nettype none
 
@@ -24,8 +25,8 @@ module riscv_core_interface (
      output logic                 mem_data_stall,
      output logic [31:0]          mem_data_store
 `ifdef SIMULATION_18447
-     // Commit packets for the verify-trace flow (riscv_commit.vh); all
-     // slots invalid until the SSC emits retire info (see LightningCore).
+     // Commit packets for the verify-trace flow (riscv_commit.vh); the
+     // in-order core retires one instruction per cycle in slot 0.
      ,
      output RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0]
                                    commit_pkts
@@ -44,9 +45,6 @@ module riscv_core_interface (
     assign mem_rsp_valid = mem_data_load_valid;
     assign mem_rsp_excpt = mem_excpt;
 
-    // I-side fetch width: words per I-cache response (Lightning fetch group)
-    localparam int FETCH_WORDS = DRIS_defs::FETCH_WAYS;
-
     /////////////////////////////// i cache signals ///////////////////////////////
     logic                                         core_req_we_i;
     logic                                         core_req_re_i;
@@ -56,7 +54,7 @@ module riscv_core_interface (
     logic                                         core_req_cancel_i;
     logic                                         core_req_stall_mem_i;
     logic [ADDRESS_SIZE - 1 : 0 ]                 core_rsp_addr_i;
-    logic [FETCH_WORDS - 1 : 0][WORD_SIZE - 1 : 0] core_rsp_data_i;
+    logic [WORD_SIZE - 1 : 0 ]                    core_rsp_data_i;
     logic                                         core_rsp_data_valid_i;
     logic                                         core_rsp_ready_i;
     logic                                         core_rsp_excpt_i;
@@ -70,7 +68,15 @@ module riscv_core_interface (
 
     /////////////////////////////// d cache signals ///////////////////////////////
     logic                                         core_req_we_d;
+    /* The class seam arbitrates I/D combinationally (core_req_re_d /
+     * choose_d_cache -> mem_rsp_ready -> controller -> mem_req_* -> back) —
+     * a false loop for Verilator's per-vector analysis, same species as
+     * fifo.sv (see porting log). Behavior blessed by the lab4b-vl rig and
+     * the full inorder asm regression. Inline waivers because v5.048
+     * ignores lint.vlt -file waivers for this file (known quirk). */
+    // verilator lint_off UNOPTFLAT
     logic                                         core_req_re_d;
+    // verilator lint_on UNOPTFLAT
     logic [ADDRESS_SIZE - 1 : 0]                  core_req_addr_d;
     logic [3:0]                                   core_req_store_mask_d;
     logic [WORD_SIZE - 1 : 0]                     core_req_store_data_d;
@@ -89,8 +95,14 @@ module riscv_core_interface (
     logic                                         read_hit_d;
     logic                                         read_miss_d;
 
-    // arbitration
+    /////////////////////////////// core signals ///////////////////////////////
+    logic                                         correct_branch_prediction;
+    logic                                         flushing;
+
+    // arbitration (UNOPTFLAT: see the core_req_re_d note above)
+    // verilator lint_off UNOPTFLAT
     logic choose_d_cache;
+    // verilator lint_on UNOPTFLAT
     assign choose_d_cache = mem_req_data_load_en_d | (mem_req_store_mask_d !== 4'b0000);
 
     always_comb begin: cache_to_mem_mux
@@ -114,52 +126,70 @@ module riscv_core_interface (
     assign d_active    = mem_req_data_load_en_d || (mem_req_store_mask_d != 0);
     assign i_d_conflict = i_active && d_active;
 
-    LightningCore #(
-        .FETCH_WORDS  (FETCH_WORDS),
-        .ADDRESS_SIZE (ADDRESS_SIZE)
-    ) core_inst (
-        .clock               (clk),
-        .reset_n             (rst_l),
-        .halted,
 `ifdef SIMULATION_18447
-        .commit_pkts,
+    /* The core's packet array is SUPERSCALAR_WAYS wide; pad it out to the
+     * fixed COMMIT_WAYS_MAX interface width (unused slots stay invalid). */
+    RISCV_Commit::commit_pkt_t [RISCV_UArch::SUPERSCALAR_WAYS-1:0]
+        core_commit_pkts;
+
+    always_comb begin : commit_pkt_padding
+        commit_pkts = '0;
+        for (int i = 0; i < RISCV_UArch::SUPERSCALAR_WAYS; i++)
+            commit_pkts[i] = core_commit_pkts[i];
+    end : commit_pkt_padding
 `endif
-        .core_req_re         (core_req_re_i),
-        .core_req_addr       (core_req_addr_i),
-        .core_req_cancel     (core_req_cancel_i),
-        .core_req_stall_mem  (core_req_stall_mem_i),
-        .core_rsp_data       (core_rsp_data_i),
-        .core_rsp_addr       (core_rsp_addr_i),
-        .core_rsp_data_valid (core_rsp_data_valid_i),
-        .core_rsp_ready      (core_rsp_ready_i),
-        .core_rsp_excpt      (core_rsp_excpt_i)
+
+    riscv_core core_inst (
+`ifdef SIMULATION_18447
+        .commit_pkts            (core_commit_pkts),
+`endif
+        .clk, .rst_l, .halted,
+        .instr_mem_excpt        (core_rsp_excpt_i),
+        .data_mem_excpt         (core_rsp_excpt_d),
+        .instr                  (core_rsp_data_i),
+        .data_load              (core_rsp_data_d),
+        .data_load_en           (core_req_re_d),
+        .data_store_mask        (core_req_store_mask_d),
+        .data_store             (core_req_store_data_d),
+        .instr_addr             (core_req_addr_i),
+        .data_addr              (core_req_addr_d),
+        .is_eviction_i,
+        .read_hit_i,
+        .read_miss_i,
+        .is_eviction_d,
+        .read_hit_d,
+        .read_miss_d,
+        .choose_d_cache,
+        .i_d_conflict,
+        .instr_stall            (core_req_stall_mem_i),
+        .data_stall             (core_req_stall_mem_d),
+        .instr_valid            (core_rsp_data_valid_i),
+        .data_valid             (core_rsp_data_valid_d),
+        .i_cache_ready          (core_rsp_ready_i),
+        .d_cache_ready          (core_rsp_ready_d),
+        .correct_branch_prediction,
+        .flushing
     );
 
-    // i-cache fixed signals (request/cancel now come from the core's IIU)
+    // i-cache fixed signals
     assign core_req_we_i         = 1'b0;
     assign core_req_store_mask_i = 4'b0000;
     assign core_req_store_data_i = 32'h0;
     assign mem_req_store_mask_i  = 4'b0000;
     assign mem_req_store_data_i  = 32'h0;
+    assign core_req_cancel_i     = ~correct_branch_prediction;
+    assign core_req_re_i         = core_rsp_ready_i;
 
-    // d-cache fixed signals — LightningCore has no memory unit yet, so the
-    // D-side is tied off idle; the controller stays instantiated to keep
-    // the seam warm for the memory unit.
-    assign core_req_re_d         = 1'b0;
-    assign core_req_addr_d       = '0;
-    assign core_req_store_mask_d = 4'b0000;
-    assign core_req_store_data_d = 32'h0;
-    assign core_req_stall_mem_d  = 1'b0;
+    // d-cache fixed signals
     assign core_req_we_d         = (core_req_store_mask_d != 4'b0000);
     assign core_req_cancel_d     = 1'b0;
 
-    cache_controller2 #(
+    cache_controller_ref #(
         .INDEX_BITS         (INSTR_CACHE_INDEX_BITS),
         .BLOCK_OFFSET_BITS  (INSTR_CACHE_BLOCK_OFFSET_BITS),
         .BLOCK_SIZE         (INSTR_CACHE_BLOCK_SIZE),
         .WAYS               (INSTR_CACHE_WAYS),
         .WORD_SIZE          (WORD_SIZE),
-        .FETCH_WORDS        (FETCH_WORDS),
         .ADDRESS_SIZE       (ADDRESS_SIZE),
         .POLICY             (INSTR_CACHE_POLICY)
     ) tony (
@@ -190,7 +220,7 @@ module riscv_core_interface (
         .read_miss              (read_miss_i)
     );
 
-    cache_controller2 #(
+    cache_controller_ref #(
         .INDEX_BITS         (DATA_CACHE_INDEX_BITS),
         .BLOCK_OFFSET_BITS  (DATA_CACHE_BLOCK_OFFSET_BITS),
         .BLOCK_SIZE         (DATA_CACHE_BLOCK_SIZE),

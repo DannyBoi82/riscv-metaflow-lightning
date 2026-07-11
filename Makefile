@@ -223,6 +223,16 @@ endif
 # and the 0/1 filename prefixes keep package files first within a directory.
 RTL_DIR_ORDER = rtl/core rtl/ooo rtl/mem tb
 SV_SRC := $(foreach d,$(RTL_DIR_ORDER),$(sort $(shell find -L $(d) -type f -name '*.sv')))
+
+# Core selection (CORE in config.mk): both riscv_core_interface*.sv files
+# define the same module name, so exactly one may be compiled.
+ifeq ($(CORE),inorder)
+    SV_SRC := $(filter-out rtl/mem/riscv_core_interface.sv,$(SV_SRC))
+else ifeq ($(CORE),lightning)
+    SV_SRC := $(filter-out rtl/mem/riscv_core_interface_inorder.sv,$(SV_SRC))
+else
+    $(error Invalid CORE '$(CORE)'. Must be one of {lightning, inorder})
+endif
 VH_SRC := $(sort $(shell find -L rtl tb -type f -name '*.vh'))
 INC_DIRS := $(sort $(shell find -L rtl tb -type d)) $(SIM_OUTPUT)
 
@@ -235,12 +245,9 @@ INC_DIRS := $(sort $(shell find -L rtl tb -type d)) $(SIM_OUTPUT)
 SIM_EXECUTABLE = sim
 SIM_COMPILE_LOG = compilation.log
 
-# Common defines for both backends. TRACE=1 enables the cycle-level register
-# write-trace check (requires a <test>.vh oracle next to the test).
+# Common defines for both backends. (The old TRACE=1 / DEBUG_RFWRTRACE
+# write-event trace check was superseded by `make verify-trace`.)
 SIM_DEFINES = +define+SIMULATION_18447 $(PARAMS)
-ifeq ($(TRACE),1)
-    SIM_DEFINES += +define+DEBUG_RFWRTRACE
-endif
 
 # --- Verilator backend ---------------------------------------------------
 VERILATOR ?= verilator
@@ -270,20 +277,13 @@ endif
 VCS_INC_FLAGS = $(addprefix +incdir+,$(abspath $(INC_DIRS)))
 
 # Rebuild automatically whenever the build configuration changes (PARAMS,
-# SEED, WAVES, TRACE, SIM, ...), not just when sources change.
-BUILD_FLAGS_ID = $(SIM)|$(SIM_DEFINES)|$(SEED)|$(WAVES)|$(if $(filter 1,$(TRACE)),$(TEST))
+# SEED, WAVES, SIM, CORE, ...), not just when sources change.
+BUILD_FLAGS_ID = $(SIM)|$(CORE)|$(SIM_DEFINES)|$(SEED)|$(WAVES)
 FLAGS_STAMP = $(SIM_OUTPUT)/.buildflags
 
 $(FLAGS_STAMP): FORCE | $(OUTPUT)
 	@mkdir -p $(SIM_OUTPUT)
 	@echo '$(BUILD_FLAGS_ID)' | cmp -s - $@ || echo '$(BUILD_FLAGS_ID)' > $@
-
-# The register write-trace oracle, copied next to the simulator when TRACE=1
-ifeq ($(TRACE),1)
-$(SIM_OUTPUT)/reg_defs.vh: $(TEST_NAME).vh | $(OUTPUT) check-test-defined
-	@cp $< $@
-$(SIM_OUTPUT)/$(SIM_EXECUTABLE): $(SIM_OUTPUT)/reg_defs.vh
-endif
 
 build: $(SIM_OUTPUT)/$(SIM_EXECUTABLE)
 
@@ -336,6 +336,10 @@ ifeq ($(WAVES),1)
     SIM_RUN_ARGS += +waves
 endif
 endif
+
+# User-specified runtime plusargs (e.g. PLUSARGS=+commit_trace). Runtime
+# only — no rebuild needed, so not part of BUILD_FLAGS_ID.
+SIM_RUN_ARGS += $(PLUSARGS)
 
 # Always re-run: the specified test can change based on user input
 .PHONY: $(SIM_REGDUMP)
@@ -479,6 +483,40 @@ refdump: $(TEST_BIN) $(REFSIM_EXECUTABLE) $(TEST) | assemble
 	@printf "Generating refdump.reg from reference sim on test $u$(TEST)$n...\n"
 	@printf "go\nrdump $(REFSIM_REGDUMP)\n" | $(REFSIM_EXECUTABLE) $(TEST)
 
+################################################################################
+# Verify-trace: per-commit architectural state compare vs the reference sim
+# (see docs/TODO-verify-trace.md and README). The core emits a commit packet
+# per retired instruction; the tb reconstructs full register state per commit
+# (+commit_trace -> commit_trace.txt) and the refsim writes the same format
+# (statetrace command); the checker reports the first divergent commit.
+################################################################################
+
+.PHONY: reftrace verify-trace
+
+REF_STATETRACE = $(OUTPUT)/reftrace.txt
+RTL_COMMIT_TRACE = $(OUTPUT)/commit_trace.txt
+TRACE_CHECKER = python3 scripts/check_commit_trace.py
+
+reftrace: $(TEST_BIN) $(REFSIM_EXECUTABLE) $(TEST) | $(OUTPUT) assemble \
+		check-test-defined
+	@printf "Generating $u$(REF_STATETRACE)$n from reference sim on test $u$(TEST)$n...\n"
+	@printf "statetrace $(abspath $(REF_STATETRACE))\ngo\nquit\n" | \
+			$(REFSIM_EXECUTABLE) $(TEST)
+
+verify-trace: reftrace | check-test-defined
+	@rm -f $(RTL_COMMIT_TRACE)  # a run without tracing must not leave a stale trace
+	@$(MAKE) --no-print-directory sim TEST=$(TEST) OUTPUT=$(OUTPUT) \
+			PLUSARGS='$(PLUSARGS) +commit_trace'
+	@printf "\nComparing the RTL commit trace against the reference state trace...\n"
+	@if $(TRACE_CHECKER) $(RTL_COMMIT_TRACE) $(REF_STATETRACE); then \
+		printf "$gCorrect! The RTL commit trace matches the reference.$n\n"; \
+	else \
+		printf "\n%-67s\t%s\n" "$u$(RTL_COMMIT_TRACE)$n" "$u$(REF_STATETRACE)$n"; \
+		printf "(view with $bscripts/view_commit_trace.py <trace>$n)\n"; \
+		printf "$rIncorrect! The RTL commit trace diverges from the reference.$n\n"; \
+		exit 1; \
+	fi
+
 # The in-repo reference simulator is built on demand; any other path
 # (e.g. the AFS class binary) must already exist.
 $(REFSIM_LOCAL): $(wildcard tools/refsim/*.c tools/refsim/*/*.c \
@@ -567,6 +605,10 @@ help:
 	@printf "$bTargets:$n\n"
 	@printf "\t$bverify$n    Run $bTEST$n and diff its register dump against\n"
 	@printf "\t          the committed <test>.reg oracle.\n"
+	@printf "\t$bverify-trace$n  Compare full architectural register state per\n"
+	@printf "\t          committed instruction against the reference sim\n"
+	@printf "\t          (see README; needs a core that emits commit packets).\n"
+	@printf "\t$breftrace$n  Generate the reference per-commit state trace only.\n"
 	@printf "\t$bregress$n   Run verify on every test with a .reg oracle\n"
 	@printf "\t          (or on $bTESTS$n if given).\n"
 	@printf "\t$bsim$n       Run $bTEST$n without verification.\n"
@@ -588,7 +630,8 @@ help:
 	@printf "\t$bPARAMS$n    Hardware overrides, e.g. '+define+LTG_DRIS_ENTRIES=32'\n"
 	@printf "\t          (all knobs: $urtl/include/config.vh$n).\n"
 	@printf "\t$bSEED$n      Verilator X-shakeout seed (--x-assign/--x-initial unique).\n"
-	@printf "\t$bTRACE$n     TRACE=1 enables cycle-level RF write-trace checking.\n"
+	@printf "\t$bCORE$n      Core to wrap: lightning (default) or inorder.\n"
+	@printf "\t$bPLUSARGS$n  Extra runtime plusargs, e.g. '+commit_trace'.\n"
 	@printf "\t$bRISCV_PREFIX$n  Toolchain prefix (auto-detected when empty).\n"
 	@printf "\n"
 	@printf "$bExamples:$n\n"
@@ -598,6 +641,7 @@ help:
 	@printf "\tmake regress\n"
 	@printf "\tmake regress TESTS='tests/asm/*.S'\n"
 	@printf "\tmake waves TEST=tests/asm/additest.S\n"
+	@printf "\tmake verify-trace TEST=tests/asm/brtest0.S CORE=inorder\n"
 	@printf "\tmake verify TEST=... PARAMS='+define+LTG_DCACHE_INDEX_BITS=6'\n"
 
 FORCE:

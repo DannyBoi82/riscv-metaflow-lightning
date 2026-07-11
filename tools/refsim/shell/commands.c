@@ -103,10 +103,32 @@ static const int STEP_MAX_NUM_ARGS      = 1;
 static const int GO_NUM_ARGS            = 0;
 
 /**
+ * Prints one compact full-state line to the state-trace file: the PC of the
+ * instruction that just executed, then x1..x31 in hex (x0 elided). This is
+ * the refsim half of the verify-trace flow — one line per architecturally
+ * committed instruction, field-compatible with the RTL commit_verifier's
+ * commit_trace.txt (which additionally appends a ' #cycle=N' comment the
+ * checker strips).
+ **/
+static void print_statetrace_line(cpu_state_t *cpu_state, uint32_t pc)
+{
+    fprintf(cpu_state->statetrace_fd, "%08x", pc);
+    for (int i = 1; i < (int)array_len(cpu_state->registers); i++) {
+        fprintf(cpu_state->statetrace_fd, " %08x",
+                register_read(cpu_state, i));
+    }
+    fprintf(cpu_state->statetrace_fd, "\n");
+    return;
+}
+
+/**
  * Run the simulator for a single cycle, incrementing the instruction count.
  **/
 static void run_simulator(cpu_state_t *cpu_state)
 {
+    // The PC of the instruction about to execute, for the state trace
+    uint32_t statetrace_pc = cpu_state->pc;
+
     if (cpu_state->verbose_mode && cpu_state->trace_mode) {
       fprintf(cpu_state->trace_fd, "{\n");
       fprintf(cpu_state->trace_fd, "  \"cycle\": %d,\n", cpu_state->cycle);
@@ -121,6 +143,11 @@ static void run_simulator(cpu_state_t *cpu_state)
     // Run the simulator for a cycle, then the increment instruction count
     process_instruction(cpu_state);
     cpu_state->cycle += 1;
+
+    // One full-state line per committed instruction (verify-trace)
+    if (cpu_state->statetrace_mode) {
+        print_statetrace_line(cpu_state, statetrace_pc);
+    }
 
     // If the user has activated verbose mode, then perform a register dump
     if (cpu_state->verbose_mode) {
@@ -717,6 +744,9 @@ static const int VERBOSE_NUM_ARGS       = 0;
 // The expected number of arguments for the verbose command
 static const int TRACE_NUM_ARGS       = 0;
 
+// The maximum number of arguments for the statetrace command (trace file)
+static const int STATETRACE_MAX_NUM_ARGS = 1;
+
 // The expected number of arguments for the quit command
 static const int QUIT_NUM_ARGS          = 0;
 
@@ -774,6 +804,42 @@ void command_trace(cpu_state_t *cpu_state, char *args[], int num_args)
       }
     } else {
       fclose(cpu_state->trace_fd);
+    }
+    return;
+}
+
+/**
+ * Toggles per-commit full-state tracing mode for the simulator.
+ *
+ * While active, the simulator writes one compact line of full architectural
+ * register state per executed instruction (the verify-trace format — see
+ * print_statetrace_line) to the given file, or "statetrace.txt" if no file
+ * was specified. On activation an anchor line with the state *before* the
+ * first instruction is written, so trace diffs are anchored at commit 0.
+ * The existing 'trace' (rf write event) command is unrelated and unchanged.
+ **/
+void command_statetrace(cpu_state_t *cpu_state, char *args[], int num_args)
+{
+    // Check that the appropriate number of arguments was specified
+    if (num_args > STATETRACE_MAX_NUM_ARGS) {
+        fprintf(stderr, "Error: Too many arguments specified to 'statetrace' "
+                "command.\n");
+        return;
+    }
+
+    // Toggle the state-trace mode for the processor
+    cpu_state->statetrace_mode = !cpu_state->statetrace_mode;
+    if (cpu_state->statetrace_mode) {
+        const char *path = (num_args > 0) ? args[0] : "statetrace.txt";
+        cpu_state->statetrace_fd = fopen(path, "w");
+        if (!cpu_state->statetrace_fd) {
+            perror("Failed to open state trace file");
+            exit(1);
+        }
+        // Anchor line: state before the first traced instruction
+        print_statetrace_line(cpu_state, cpu_state->pc);
+    } else {
+        fclose(cpu_state->statetrace_fd);
     }
     return;
 }
@@ -874,6 +940,11 @@ void command_help(cpu_state_t *cpu_state, char *args[], int num_args)
 	       "active, the simulator dumps a trace of regfile writes to "
 	       "trace.txt. When used with verbose, on-screen dump is disabled,"
 	       "and a more extended trace is written to trace.txt.");
+    print_help("statetrace (file)?", "Toggles per-commit state tracing. "
+            "While active, one line of full architectural register state is "
+            "written per executed instruction (plus an initial anchor line) "
+            "to the given file (default statetrace.txt). This is the "
+            "verify-trace format the RTL commit trace is diffed against.");
     print_help("q[uit]", "Quit the simulator. Can also be done with an EOF "
             "(CTRL-D).");
     print_help("h[elp]|?", "Display this help message.");

@@ -41,6 +41,12 @@ lint_off -rule SYNCASYNCNET -file "*/tb/testbench.sv"
 lint_off -rule BLKSEQ -file "*/tb/testbench.sv"
 lint_off -rule BLKSEQ -file "*/tb/register_file.sv"
 
+// tb/commit_verifier.sv: the shadow-regfile update is deliberately built
+// with blocking assigns into a temp (upd) inside always_ff, so the same
+// edge's commits are visible to the halt-edge register dump; no
+// cross-process readers of upd.
+lint_off -rule BLKSEQ -file "*/tb/commit_verifier.sv"
+
 // tb: mem_data_stall output unused by the testbench (tied 0 inside).
 lint_off -rule PINMISSING -file "*/tb/testbench.sv"
 
@@ -56,3 +62,12 @@ lint_off -rule PINMISSING -file "*/tb/testbench.sv"
 // priority chain that Verilator's per-vector analysis flags as circular.
 // Converges in one relaxation pass; performance-only, not correctness.
 lint_off -rule UNOPTFLAT -file "*/rtl/ooo/SaneStateController.sv"
+
+// CORE=inorder only: the vendored class seam arbitrates I/D controllers
+// combinationally (choose_d_cache -> mem_rsp_ready -> controller ->
+// mem_req_* -> choose_d_cache), and cache3's tag_hit joins that cut when
+// instantiated under cache_controller_ref. Same false-loop species as the
+// fifo.sv case (see porting log); behavior blessed end-to-end by the
+// lab4b-vl rig and the full inorder asm regression. Performance-only.
+lint_off -rule UNOPTFLAT -file "*/rtl/mem/riscv_core_interface_inorder.sv"
+lint_off -rule UNOPTFLAT -file "*/rtl/mem/cache3.sv"

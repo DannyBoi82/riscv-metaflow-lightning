@@ -39,6 +39,8 @@ typedef struct cpu_state {
     bool verbose_mode;                  // Indicates if verbose mode is active
     bool trace_mode;                    // Indicates if trace mode is active
     FILE *trace_fd;                     // Trace file descriptor
+    bool statetrace_mode;               // Indicates if state-trace mode is active
+    FILE *statetrace_fd;                // State-trace file descriptor
     bool halted;                        // Indicates if the CPU is halted
     int cycle;                          // Number of processor cycles
     uint32_t pc;                        // Current program counter

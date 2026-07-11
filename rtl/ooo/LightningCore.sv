@@ -1,5 +1,7 @@
 `default_nettype none
 
+`include "riscv_commit.vh"
+
 import DRIS_defs::*;
 import RISCV_ISA::*;
 import RISCV_UArch::*;  // Import microarchitecture parameters and definitions
@@ -43,6 +45,19 @@ module LightningCore #(
     input  logic clock, reset_n,
 
     output logic halted,
+
+`ifdef SIMULATION_18447
+    /* Commit packets for the verify-trace flow (see riscv_commit.vh).
+     * TODO(SSC): only partially populated — the SSC's reg_commits carry
+     * neither PC/insn nor non-writing retirements (branches, stores, the
+     * halting ecall), so packets fire only for register-writing
+     * retirements with pc/insn = 0. That keeps the harness's shadow
+     * regfile (and the end-state simulation.reg dump) correct, but
+     * verify-trace is unsupported on CORE=lightning until the SSC emits
+     * full per-slot retire info. */
+    output RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0]
+                 commit_pkts,
+`endif
 
     /* ============================================================
      * I-side cache controller (core_req_* / core_rsp_* seam),
@@ -260,20 +275,40 @@ module LightningCore #(
         end
     end : rf_write_wiring
 
+    /* Write-only commit packets: see the TODO(SSC) note on the commit_pkts
+     * port — reg_commits lack pc/insn and non-writing retirements, so
+     * packets are emitted only for register-writing retirements (pc/insn
+     * report as 0). That is enough for the harness's shadow regfile (and
+     * therefore the end-state simulation.reg dump) to track architectural
+     * state; the per-commit trace can't align with the refsim until the
+     * SSC provides the rest, so verify-trace stays inorder-only. */
+    RISCV_Commit::commit_pkt_t [RF_WAYS-1:0] rf_commit_pkts;
+
     register_file #(
         .WAYS (RF_WAYS)
     ) rf (
-        .clk      (clock),
-        .rst_l    (reset_n),
-        .halted   (halted),
-        .rd_we    (rf_we),
-        .rs1      (rf_rs1),
-        .rs2      (rf_rs2),
-        .rd       (rf_rd),
-        .rd_data  (rf_rd_data),
-        .rs1_data (rf_rs1_data),
-        .rs2_data (rf_rs2_data)
+        .clk          (clock),
+        .rst_l        (reset_n),
+        .rd_we        (rf_we),
+        .rs1          (rf_rs1),
+        .rs2          (rf_rs2),
+        .rd           (rf_rd),
+        .rd_data      (rf_rd_data),
+        .commit_valid (rf_we),
+        .commit_pc    ('0),
+        .commit_insn  ('0),
+        .rs1_data     (rf_rs1_data),
+        .rs2_data     (rf_rs2_data),
+        .commit_pkts  (rf_commit_pkts)
     );
+
+`ifdef SIMULATION_18447
+    always_comb begin : commit_pkt_padding
+        commit_pkts = '0;
+        for (int i = 0; i < RF_WAYS; i++)
+            commit_pkts[i] = rf_commit_pkts[i];
+    end : commit_pkt_padding
+`endif
 
 endmodule : LightningCore
 

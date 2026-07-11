@@ -14,6 +14,17 @@
 SIM ?= verilator
 
 # ------------------------------------------------------------------------
+# Core selection: which riscv_core_interface implementation to build.
+#   lightning — the OoO DRIS/Metaflow core (rtl/ooo, default)
+#   inorder   — the 8-stage in-order core (rtl/core/riscv_core.sv), which
+#               passes the full class autograder suite; useful for blessing
+#               harness changes independently of Lightning bring-up.
+# Both rtl/mem/riscv_core_interface*.sv files define the same module name;
+# the Makefile compiles only the selected one.
+# ------------------------------------------------------------------------
+CORE ?= lightning
+
+# ------------------------------------------------------------------------
 # RISC-V toolchain
 #
 # Leave RISCV_PREFIX empty to auto-detect from the candidates below (first
