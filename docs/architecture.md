@@ -4,16 +4,19 @@ What every file/module does and how they fit together, so a new session
 doesn't have to re-explore the tree. Companion docs: `docs/porting-log.md`
 (migration history + gotchas, **read before touching harness/build**),
 `docs/TODO-verify-trace.md` (commit-trace design), `docs/TODO-IIU.md`,
-`docs/new-repo.md` (original migration plan). Last updated: 2026-07-11.
+`docs/new-repo.md` (original migration plan), `docs/TODO-memory.md` (memory
+unit design + working notes), `docs/memorable-bugs.md`. Last updated:
+2026-07-30.
 
 ## Big picture
 
 Two RISC-V RV32I cores share one simulation harness and one build system:
 
 - **Lightning** (`rtl/ooo/`, `CORE=lightning`, default) — the OoO
-  DRIS/Metaflow-style core being built. No memory unit yet: loads/stores
-  produce wrong results by design (D-side tied off), so only ALU/branch/jump
-  asm tests pass.
+  DRIS/Metaflow-style core being built. The memory unit (`MemoryScheduler`
+  + the D-side cache seam) landed 2026-07-30, so loads and stores now
+  work: 53/57 `tests/asm` pass, the exceptions being the 3 mul tests (no M
+  extension anywhere) and `memtest2` (runs to completion, wrong result).
 - **In-order core** (`rtl/core/riscv_core.sv`, `CORE=inorder`) — the blessed
   8-stage class core (passes the full autograder suite). Used as a known-good
   rig for harness work (e.g. the verify-trace flow) so harness bugs are never
@@ -30,7 +33,7 @@ Simulation stack, top to bottom:
       ├─ main_memory (behavioral, loads mem.*.bin sections)
       ├─ delay_buffer (models multi-cycle pipelined memory latency)
       └─ riscv_core_interface          <- CORE knob picks the file
-           ├─ [lightning] LightningCore + 2x cache_controller2 (D-side idle)
+           ├─ [lightning] LightningCore + 2x cache_controller2 (I + D)
            └─ [inorder]   riscv_core   + 2x cache_controller_ref
                                 (each core instantiates register_file inside
                                  itself as instance `rf`)
@@ -95,7 +98,11 @@ per-instruction trace (`statetrace` command).
   Imported by Lightning and the in-order core alike.
 - `riscv_decode.sv` — one-instruction combinational decoder
   (instr → `ctrl_signals_t`). Used by the in-order core's D stage **and**
-  instantiated per fetch slot inside Lightning's IIU.
+  instantiated per fetch slot inside Lightning's IIU. ECALL decodes with
+  `uses_rs1`/`uses_rs2` set and both source registers forced to a0, with
+  `alu_op = ALU_PASS`, so a0 flows to the ALU result — Lightning needs it
+  there to tell a halting ecall (a0 == 10) from any other syscall. Shared
+  with the in-order core; verified no regression there.
 - `riscv_core.sv` — the 8-stage in-order pipeline
   (F1→F2→F3→D→E→M1→M2→W; 3 fetch stages cover the 2-cycle I$, M1/M2 the
   2-cycle D$). BTB branch prediction resolved in M1; D-stage forwarding;
@@ -116,45 +123,122 @@ per-instruction trace (`statetrace` command).
 
 ## rtl/ooo — Lightning (DRIS/Metaflow OoO core)
 
+**Memory is two-phase**, per the Metaflow spec, and that shapes most of
+what follows: phase 1 is an ordinary ALU dispatch that computes the
+address (parked in the entry's `result_data`, marked `mem_addr_ready`,
+*no* result published); phase 2 is a second schedule by the
+`MemoryScheduler` against the D-cache. Loads write back their data
+through a dedicated DRIS writeback port; stores are released to the cache
+only at retirement.
+
 - `1DRIS_defs.sv` — `package DRIS_defs`: sizes derived from LTG_*
-  (FETCH_WAYS=4, EXECUTE_WAYS, DRIS_NUM_ENTRIES, REG_FILE_WRITE_PORTS...)
-  and every inter-unit packet/struct type (`dris_entry_t`,
-  `dris_intake_pkt_t`, `issue_pkt_t`, `dris_writeback_pkt_t`,
-  `reg_file_commit_pkt_t`, `dris_id_t` with wrap bit, lockers).
+  (DRIS_NUM_ENTRIES=32, FETCH_WAYS=4, EXECUTE_WAYS=4,
+  REG_FILE_WRITE_PORTS=7, MEMORY_READ_PORTS=1, MEMORY_WRITE_PORTS=1...)
+  and every inter-unit packet/struct type (`dris_entry_t` — including the
+  `mem_addr_ready` entry-state bit, `dris_intake_pkt_t`, `issue_pkt_t`,
+  `memory_issue_pkt_t` (the D-side request: addr/re/we/store mask+data,
+  plus the DRIS id and ctrl_signals that ride through the cache),
+  `dris_writeback_pkt_t`, `reg_file_commit_pkt_t`, `dris_id_t` with wrap
+  bit, lockers). Also `MEM_WORD_SIZE`/`MEM_ADDRESS_SIZE`, derived from
+  XLEN because a package can't see `parameters.vh`'s $unit-scope decls.
 - `DRIS.sv` — the Deferred-scheduling Register Instruction Shelf: the
   central instruction/result buffer (unified ROB+RS+rename via "lockers").
-  Intake from IIU, writeback ports from exec ways, entry array read by
-  Scheduler/SSC. Drops writebacks whose entry was flushed.
+  Intake from IIU, writeback ports from exec ways + the load return, entry
+  array read by Scheduler/MemoryScheduler/SSC. Drops writebacks whose entry
+  was flushed. Two subtleties worth knowing:
+  - **AGU-pass writebacks don't publish.** A load/store writeback arriving
+    while `mem_addr_ready` is still 0 is the address phase: it stores
+    `result_data`, sets `mem_addr_ready`, and *clears* `dispatched` (so the
+    MemoryScheduler can pick it up), but leaves `result_valid`/`executed` at
+    0 and suppresses the unlock broadcast. Publishing there would hand
+    dependents the address as their operand.
+  - **Same-cycle intake bypass** (`completing_wb()`): a dependent renamed in
+    the same cycle its producer's completing writeback fires must not lock —
+    the unlock broadcast scans the *old* locker state and can't see the
+    newborn entry, so the lock would never clear. AGU passes are excluded
+    from the bypass for the reason above.
+  - The syscall trap bit is set only for `syscall && result_data == 10`
+    (a0 == `ECALL_ARG_HALT`); other ecalls retire normally. That is what
+    makes `syscalltest` pass.
 - `InstructionIssueUnit.sv` — front end: drives the I-cache controller
   seam (request/cancel), receives FETCH_WORDS-wide fetch groups,
   per-slot `riscv_decode`, renames against DRIS lockers, emits
   prefix-contiguous intake groups (slot w gets DRIS ID fetch_ptr+w);
   contains `BranchShelf` (verifies branches/JALRs, fences retirement via
   oldest-branch id, triggers flush masks on mispredict, trains the BTB).
-- `Scheduler.sv` — scans a window of DRIS entries from the retire pointer
-  for ready instructions, reads operands (DRIS lockers or regfile read
-  ports), issues up to EXEC_UNITS packets/cycle, marks entries dispatched.
+- `Scheduler.sv` — the integer/phase-1 scheduler: scans a window of DRIS
+  entries from the retire pointer for ready instructions, reads operands
+  (DRIS lockers or regfile read ports), issues up to EXEC_UNITS
+  packets/cycle, marks entries dispatched. Loads/stores go through here
+  too, for their address computation.
+- `MemoryScheduler.sv` — phase 2. Scans the same window for (a) loads whose
+  address is ready and (b) the one store the SSC has declared releasable,
+  and drives up to `TOTAL_PORTS` `memory_issue_pkt_t`s. Ordering rules:
+  - A load may not issue past an older store whose address isn't computed
+    yet (*imprecise* case) or whose address matches (*unsafe* case) —
+    `check_older_writes()`.
+  - A store may only issue in a cycle where its entry is in `retire_vector`,
+    i.e. it is actually retiring — memory is written only by the oldest
+    instruction, per the patent.
+  - Store data (and only store data) is read from the regfile at issue, on
+    rs2; the address already rides the entry's `result_data`.
+  - `UNIFIED_RW_PORTS` (the default, set at the top of the file) shares one
+    port set between loads and stores, filling stores first so writes win;
+    `SEPARATE_RW_PORTS` splits them by direction. Elaboration fails if
+    neither is defined.
+- `IntExecutionUnit.sv` — one ALU way: `riscv_alu` + next-PC calc
+  (`PC_cond`/`PC_uncond`/`PC_indirect`) → `dris_writeback_pkt_t`. Was an
+  inline `ExecutionUnit` module inside LightningCore until the memory work
+  split it out.
 - `LightningCore.sv` — top: wires IIU → DRIS → Scheduler → registered
-  issue stage → per-way `ExecutionUnit` (riscv_alu + next-PC calc) →
-  writeback/update bus → DRIS; SSC beside all of it; instantiates
-  `register_file` (RF_WAYS = retire slots) written by the SSC's
-  `reg_commits`. Exec stage is a real pipeline stage — never clear
-  `issue_pkts_reg` on flush (older in-flight instructions must complete).
-  `halted` = syscall entry reaching the retire head. Exposes a
-  (currently all-invalid) `commit_pkts` port — TODO(SSC): populate once
-  the SSC carries pc/insn and non-writing retirements.
+  issue stage → per-way `IntExecutionUnit` → writeback/update bus → DRIS;
+  MemoryScheduler and SSC beside all of it; instantiates `register_file`
+  (RF_WAYS = retire slots) written by the SSC's `reg_commits`. Also owns:
+  - **The D-cache port drive** (`d_request_drive`): `MEM_ISSUE_WAYS` issue
+    packets arbitrated down to the single cache request. Must stay
+    combinational — the controller probes live and the SSC gates a store's
+    retirement on `d_cache_ready` in the same cycle the store issues, so a
+    registered request would retire the store before the cache saw it. It
+    also must fall back to idle, or the last request replays forever.
+  - **The load return path**: `writeback_pkts[EXEC_UNITS]` is driven
+    straight from `core_rsp_*_d` (id, valid, ctrl_signals), with
+    `get_load_data()` doing the sign/zero-extending byte/half alignment
+    using the byte offset from the entry's parked address.
+  - Regfile read ports are split by owner: ways `[0, EXEC_UNITS)` to the
+    integer Scheduler, `[EXEC_UNITS, EXEC_UNITS+MEM_ISSUE_WAYS)` to the
+    MemoryScheduler; leftover pairs read x0.
+  - Exec stage is a real pipeline stage — never clear `issue_pkts_reg` on
+    flush (older in-flight instructions must complete). `halted` =
+    trapping entry (halting ecall / illegal) reaching the retire head.
+    Exposes a write-only `commit_pkts` port — TODO(SSC): populate once the
+    SSC carries pc/insn and non-writing retirements.
 - `SaneStateController.sv` — retirement: walks the DRIS from the retire
   pointer, retires completed entries in program order up to the branch
   fence, drives `reg_commits` to the regfile write ports (highest way =
-  youngest wins on WAW), clears retired/flushed valid bits, releases
-  stores (placeholder), raises `trap_valid` on syscall/illegal (= halt).
+  youngest wins on WAW), raises `trap_valid` on halting-syscall/illegal
+  (= halt). Memory-related duties:
+  - It no longer computes `clear_valid`; it publishes raw
+    `retire_vector` and `flush_vector` (both **entry-indexed**, not
+    slot-indexed — `retire_ready_vector` is a window counted from
+    `retire_ptr` and gets scattered back onto entry indices) and lets each
+    consumer decide. The DRIS ORs them into its valid-clear; the
+    MemoryScheduler uses `retire_vector` as the store-release gate.
+  - `store_ready`/`store_id` name the entry at the retire head when it is a
+    valid store with its address computed. Retire slot 0 additionally
+    treats `store_ready & d_cache_ready` as eligible, so a store retires
+    exactly in the cycle the cache accepts its write.
+  - `RETIRES_PER_CYCLE` = `REG_RETIRES_PER_CYCLE` (regfile write ports) +
+    `MEMORY_RETIRES_PER_CYCLE` (memory write ports).
 
 ## rtl/mem — cache controllers, caches, core interfaces
 
 - `riscv_core_interface.sv` — **lightning** wrapper: LightningCore +
   I-side `cache_controller2` (FETCH_WORDS-wide responses) + D-side
-  `cache_controller2` tied off idle (no memory unit yet); arbitration mux
-  between I/D controllers onto the single testbench memory port.
+  `cache_controller2` driven by the core's MemoryScheduler; arbitration
+  mux between I/D controllers onto the single testbench memory port. The
+  I-side ties off the id/ctrl_signals request fields (id = 6'hF) and
+  leaves the matching response fields unconnected — only the D-side uses
+  them.
 - `riscv_core_interface_inorder.sv` — **inorder** wrapper (the old class
   seam): riscv_core + two `cache_controller_ref` (instances `tony`/
   `tony_d`), same outer port list as the lightning wrapper.
@@ -162,7 +246,11 @@ per-instruction trace (`statetrace` command).
   (1-word responses, 2-deep response FIFO, live request acceptance).
 - `cache_controller2.sv` — writeback / write-allocate controller, same
   seam and timing contract as ref; used by Lightning (I-side widened to
-  FETCH_WORDS).
+  FETCH_WORDS). Carries a `dris_id_t` + `ctrl_signals_t` alongside each
+  request: latched with the in-process request, pushed through the
+  response FIFO with the data, and returned as `core_rsp_id`/
+  `core_rsp_ctrl_signals` — that's how an out-of-order load response finds
+  its DRIS entry and knows its load width.
 - `cache3.sv` — the cache array behind the controllers (ways/sets/policy
   parameterized, eviction/hit/miss counters exported).
 - `fifo.sv` — response FIFO used by the controllers (deq_data split into
@@ -256,13 +344,15 @@ rd==rs1 — see porting log). RV32I only, no M — mul tests can't be oracled.
    verify-trace blocked on SSC pc/insn + non-writing retirements). See
    README "verify-trace" for the flow and the commit-packet contract,
    `docs/TODO-verify-trace.md` for design rationale + remaining items.
-3. **Ground truth**: VCS on AFS is the semantics oracle; Verilator is the
-   daily driver. Expected failures (lightning): all load/store/mul asm
-   tests, all tests/c and tests/perf, **and syscalltest** (Lightning
-   halts on *any* syscall reaching the retire head, so the non-halting
-   ecall test dies early — pre-existing, verified at commit 00c8ebb).
-   In-order core: everything passes except the 3 mul tests (no M
-   extension anywhere, refsim included).
+3. **Ground truth**: VCS on AFS is the semantics oracle. Expected
+   failures as of 2026-07-30 (`make regress SIM=vcs`, full `tests/asm`):
+   - **lightning** — 53/57. `multest`, `dependMul`, `dependMulLow` (no M
+     extension anywhere, refsim included) and `memtest2` (runs to
+     completion, wrong result — the one known memory-unit bug). Loads,
+     stores, and `syscalltest` all pass since the memory unit landed.
+     `tests/c/fibi.c` passes; `tests/c/fibm.c` hangs (watchdog fires) —
+     same behavior as the pre-port repo, not a regression.
+   - **inorder** — everything except the same 3 mul tests.
 
 ## Lookup reference (fine-grained pointers found the hard way)
 
@@ -273,6 +363,19 @@ rd==rs1 — see porting log). RV32I only, no M — mul tests can't be oracled.
   the writeback mux and STALL & FLUSH CONTROL.
 - Lightning regfile write wiring (`rf_we` from SSC `reg_commits`) +
   commit-packet tie-off: bottom of `LightningCore.sv` (rf instantiation).
+- Memory path, in dispatch order: address phase is an ordinary
+  `Scheduler.sv` dispatch; the AGU-pass special case is in `DRIS.sv`'s
+  writeback loop (`mem_addr_ready` branch); phase-2 selection is
+  `MemoryScheduler.sv` `selection_logic` + `check_older_writes()`; the
+  request reaches the cache through `d_request_drive` in
+  `LightningCore.sv`; the response comes back at
+  `writeback_pkts[EXEC_UNITS]` in the same file (`get_load_data()`); the
+  store release is `store_ready`/`store_id` at the bottom of
+  `SaneStateController.sv`.
+- Byte/half handling lives in three places that must agree: store mask +
+  store data in `MemoryScheduler.sv` (`get_store_mask`/`get_store_data`),
+  load extension in `LightningCore.sv` (`get_load_data`), and
+  `ldst_mode` decode in `riscv_decode.sv`.
 - Old class dump/trace code (print_cpu_state, DEBUG_RFWRTRACE checker):
   deleted from `tb/register_file.sv` — recover with
   `git show 00c8ebb:tb/register_file.sv`.

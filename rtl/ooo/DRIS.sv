@@ -27,7 +27,7 @@ module DRIS
     // the DRIS — exec ways are the sole producers of register-file-bound
     // data (JAL/JALR links ride result_data_W; next PCs ride next_pc_W).
     localparam int WRITEBACK_PORTS =
-    EXEC_UNITS + MEMORY_WRITE_PORTS + MEMORY_READ_PORTS
+    EXEC_UNITS + MEMORY_READ_PORTS
     )(
 
     input  logic clock, reset_n,
@@ -117,39 +117,54 @@ module DRIS
                         dris_entries[writeback_pkts[i].id_W.id_index].debug_instr <= writeback_pkts[i].debug_instr_dris_W;
                     `endif
 
-                    dris_entries[writeback_pkts[i].id_W.id_index].result.result_data  <= writeback_pkts[i].result_data_W;
-                    dris_entries[writeback_pkts[i].id_W.id_index].result.result_valid <= '1;
-                    dris_entries[writeback_pkts[i].id_W.id_index].entry_state.executed <= '1; 
-                    if (|writeback_pkts[i].ctrl_signals_W.syscall || writeback_pkts[i].ctrl_signals_W.illegal_instr) begin
-                        dris_entries[writeback_pkts[i].id_W.id_index].entry_state.trap <= '1;
-                    end
+                    if ((writeback_pkts[i].ctrl_signals_W.memRead || writeback_pkts[i].ctrl_signals_W.memWrite) &&
+                    ~dris_entries[writeback_pkts[i].id_W.id_index].entry_state.mem_addr_ready) begin
+                        // AGU pass of a load/store: park the address in
+                        // result_data for the memory scheduler, but do NOT
+                        // publish a result — result_valid stays 0 and the
+                        // unlock broadcast is suppressed, so dependents keep
+                        // waiting for the load's *data* writeback. Publishing
+                        // here hands dependents the address as their operand.
+                        dris_entries[writeback_pkts[i].id_W.id_index].result.result_data <= writeback_pkts[i].result_data_W;
+                        dris_entries[writeback_pkts[i].id_W.id_index].entry_state.mem_addr_ready <= '1;
+                        dris_entries[writeback_pkts[i].id_W.id_index].entry_state.dispatched <= '0;
+                    end else begin
+                        dris_entries[writeback_pkts[i].id_W.id_index].result.result_data  <= writeback_pkts[i].result_data_W;
+                        dris_entries[writeback_pkts[i].id_W.id_index].result.result_valid <= '1;
+                        dris_entries[writeback_pkts[i].id_W.id_index].entry_state.executed <= '1;
 
-                    // broadcasting unlock to all lockers watching this result
-                    for (int j = 0; j < ENTRIES; j++) begin
-                        if (dris_entries[j].entry_state.valid) begin
-                            if (dris_entries[j].locker_1.locked         &&
-                                dris_entries[j].locker_1.locker_id      == writeback_pkts[i].id_W.id_index &&
-                                dris_entries[j].locker_1.locker_color   == writeback_pkts[i].id_W.id_color) begin
-                                    dris_entries[j].locker_1.locked <= '0;
-                            end
-                            if (dris_entries[j].locker_2.locked         &&
-                                dris_entries[j].locker_2.locker_id      == writeback_pkts[i].id_W.id_index &&
-                                dris_entries[j].locker_2.locker_color   == writeback_pkts[i].id_W.id_color) begin
-                                    dris_entries[j].locker_2.locked <= '0;
+                        // broadcasting unlock to all lockers watching this result
+                        for (int j = 0; j < ENTRIES; j++) begin
+                            if (dris_entries[j].entry_state.valid) begin
+                                if (dris_entries[j].locker_1.locked         &&
+                                    dris_entries[j].locker_1.locker_id      == writeback_pkts[i].id_W.id_index &&
+                                    dris_entries[j].locker_1.locker_color   == writeback_pkts[i].id_W.id_color) begin
+                                        dris_entries[j].locker_1.locked <= '0;
+                                end
+                                if (dris_entries[j].locker_2.locked         &&
+                                    dris_entries[j].locker_2.locker_id      == writeback_pkts[i].id_W.id_index &&
+                                    dris_entries[j].locker_2.locker_color   == writeback_pkts[i].id_W.id_color) begin
+                                        dris_entries[j].locker_2.locked <= '0;
+                                end
                             end
                         end
+                    end
+
+                    if ((writeback_pkts[i].ctrl_signals_W.syscall &&  writeback_pkts[i].result_data_W == 'd10) 
+                    || writeback_pkts[i].ctrl_signals_W.illegal_instr) begin
+                        dris_entries[writeback_pkts[i].id_W.id_index].entry_state.trap <= '1;
                     end
                 end
             end: writeback_writes
 
-            // setting dispatched bit
+            // setting dispatched bit (from schedulers)
             for (int i = 0; i < ENTRIES; i++) begin: dispatched_bit_set
                 if (set_dispatched[i]) begin
                     dris_entries[i].entry_state.dispatched <= '1;
                 end
             end: dispatched_bit_set
 
-            // clearing valid bit on retirement
+            // clearing valid bit on retirement (from ssc)
             for (int i = 0; i < ENTRIES; i++) begin: valid_bit_clear
                 if (clear_valid[i]) begin
                     dris_entries[i].entry_state.valid <= '0;
@@ -165,6 +180,30 @@ module DRIS
     dris_id_t dep2 [FETCH_WAYS-1:0];
     logic fetch_group_dep1_valid [FETCH_WAYS-1:0];
     logic fetch_group_dep2_valid [FETCH_WAYS-1:0];
+    logic dep1_completing_now [FETCH_WAYS-1:0];
+    logic dep2_completing_now [FETCH_WAYS-1:0];
+
+    // Same-cycle intake bypass: a dependent arriving from fetch in the exact
+    // cycle its producer's completing writeback fires must not lock — the
+    // unlock broadcast scans the *old* locker state, so it can't see the
+    // newborn entry and the lock would never clear. An AGU-pass writeback
+    // (load/store address, mem_addr_ready not yet set) doesn't count: it
+    // publishes no result, so the dependent still needs to lock and wait
+    // for the data writeback.
+    function automatic logic completing_wb(dris_id_t dep);
+        for (int p = 0; p < WRITEBACK_PORTS; p++) begin
+            if (writeback_pkts[p].valid_W &&
+                writeback_pkts[p].id_W.id_index == dep.id_index &&
+                writeback_pkts[p].id_W.id_color == dep.id_color &&
+                !((writeback_pkts[p].ctrl_signals_W.memRead ||
+                   writeback_pkts[p].ctrl_signals_W.memWrite) &&
+                  ~dris_entries[dep.id_index].entry_state.mem_addr_ready)) begin
+                return 1'b1;
+            end
+        end
+        return 1'b0;
+    endfunction
+
     always_comb begin: locker_init_comb_logic
 
         for (int q = 0; q < FETCH_WAYS; q++) begin
@@ -197,13 +236,17 @@ module DRIS
                     end
                 end
 
+                dep1_completing_now[i] = completing_wb(dep1[i]);
+                dep2_completing_now[i] = completing_wb(dep2[i]);
+
                 locker_1_comb[i].locker_id      = dep1[i].id_index;
                 locker_1_comb[i].locker_color   = dep1[i].id_color;
 
-                locker_1_comb[i].locked         = 
+                locker_1_comb[i].locked         =
                 (dep1[i].id_valid &
                 dris_entries[dep1[i].id_index].entry_state.valid &
-                !dris_entries[dep1[i].id_index].result.result_valid) |
+                !dris_entries[dep1[i].id_index].result.result_valid &
+                !dep1_completing_now[i]) |
                 fetch_group_dep1_valid[i]; // intra-fetch-group dependency always locks
 
                 locker_1_comb[i].locker_valid   = dep1[i].id_valid;
@@ -212,11 +255,12 @@ module DRIS
                 locker_2_comb[i].locker_color   = dep2[i].id_color;
 
                 // only lock if there is a valid dependency, the entry is still in flight,
-                // and the result isn't already available
-                locker_2_comb[i].locked         = 
+                // and the result isn't already available (or completing this very cycle)
+                locker_2_comb[i].locked         =
                 (dep2[i].id_valid &
                 dris_entries[dep2[i].id_index].entry_state.valid &
-                !dris_entries[dep2[i].id_index].result.result_valid) |
+                !dris_entries[dep2[i].id_index].result.result_valid &
+                !dep2_completing_now[i]) |
                 fetch_group_dep2_valid[i]; // intra-fetch-group dependency always locks
                 locker_2_comb[i].locker_valid   = dep2[i].id_valid;
             end else begin

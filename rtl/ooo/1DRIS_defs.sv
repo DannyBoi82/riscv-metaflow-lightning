@@ -31,12 +31,21 @@ package DRIS_defs;
     // how many entries the scheduler checks for ready-ness each cycle
     localparam int SCHEDULER_ENTRIES_CHECKED = `LTG_SCHED_ENTRIES_CHECKED;
 
+    // Cache-seam widths. parameters.vh declares ADDRESS_SIZE/WORD_SIZE at
+    // $unit scope, which a package cannot see, and including it here would
+    // fire its L1_POLICIES guard before riscv_core_interface gets it. Derive
+    // them from XLEN instead: the memory bus is word-addressed, so the
+    // address drops the 2 byte-offset bits. Must track parameters.vh.
+    localparam int MEM_WORD_SIZE    = XLEN;      // == WORD_SIZE (32)
+    localparam int MEM_ADDRESS_SIZE = XLEN - 2;  // == ADDRESS_SIZE (30)
+
 
     typedef struct packed {
         logic valid;        // slot is occupied
         logic dispatched;   // sent to an execution unit
         logic executed;     // result field contains valid data
         logic trap;         // instruction raised a trap
+        logic mem_addr_ready; // memory address has been computed (for loads/stores)
     } dris_entry_state_t;
 
     // no stage suffixes because they are used by all stages
@@ -108,6 +117,29 @@ package DRIS_defs;
         dris_id_t id_I;                       // DRIS ID for register renaming
         logic ready_I;                        // indicates if the instruction is ready to be dispatched (operands are ready)
     } issue_pkt_t;
+
+    //core -> cache controller request side interface
+    typedef struct packed {
+        `ifdef DEBUG
+            logic [XLEN-1:0] debug_instr_I;
+            logic [XLEN-1:0] debug_pc_I;
+        `endif
+
+        logic                          core_req_we;
+        logic                          core_req_re;
+        logic [MEM_ADDRESS_SIZE-1:0]   core_req_addr;
+        logic [MEM_WORD_SIZE-1:0]      core_req_store_data;
+        logic                          core_req_cancel;
+        logic                          core_req_stall_mem;
+        logic [3:0]                    core_req_store_mask;
+        dris_id_t                      core_req_id;
+        ctrl_signals_t                  core_req_ctrl_signals;
+        logic [1:0]                    byte_offset;
+
+    } memory_issue_pkt_t;
+
+    //things the processor needs for a load request
+    // id, ctrl_signals, byte_offset
 
     typedef struct packed {
 

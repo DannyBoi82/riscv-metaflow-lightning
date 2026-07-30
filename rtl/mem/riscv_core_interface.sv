@@ -76,11 +76,15 @@ module riscv_core_interface (
     logic [WORD_SIZE - 1 : 0]                     core_req_store_data_d;
     logic                                         core_req_cancel_d;
     logic                                         core_req_stall_mem_d;
+    dris_id_t                                     core_req_id_d;
+    ctrl_signals_t                                core_req_ctrl_signals_d;
     logic [ADDRESS_SIZE - 1 : 0 ]                 core_rsp_addr_d;
     logic [WORD_SIZE - 1 : 0 ]                    core_rsp_data_d;
     logic                                         core_rsp_data_valid_d;
     logic                                         core_rsp_ready_d;
     logic                                         core_rsp_excpt_d;
+    dris_id_t                                     core_rsp_id_d;
+    ctrl_signals_t                                core_rsp_ctrl_signals_d;
     logic                                         mem_req_data_load_en_d;
     logic [3:0]                                   mem_req_store_mask_d;
     logic [ADDRESS_SIZE - 1 : 0 ]                 mem_req_addr_d;
@@ -132,7 +136,26 @@ module riscv_core_interface (
         .core_rsp_addr       (core_rsp_addr_i),
         .core_rsp_data_valid (core_rsp_data_valid_i),
         .core_rsp_ready      (core_rsp_ready_i),
-        .core_rsp_excpt      (core_rsp_excpt_i)
+        .core_rsp_excpt      (core_rsp_excpt_i),
+
+        // D-side: driven by the core's MemoryScheduler (was tied off idle
+        // while the memory unit did not exist).
+        .core_req_re_d         (core_req_re_d),
+        .core_req_we_d         (core_req_we_d),
+        .core_req_addr_d       (core_req_addr_d),
+        .core_req_store_mask_d (core_req_store_mask_d),
+        .core_req_store_data_d (core_req_store_data_d),
+        .core_req_cancel_d     (core_req_cancel_d),
+        .core_req_stall_mem_d  (core_req_stall_mem_d),
+        .core_req_ctrl_signals_d (core_req_ctrl_signals_d),
+        .core_req_id_d         (core_req_id_d),
+        .core_rsp_data_d       (core_rsp_data_d),
+        .core_rsp_addr_d       (core_rsp_addr_d),
+        .core_rsp_data_valid_d (core_rsp_data_valid_d),
+        .core_rsp_ready_d      (core_rsp_ready_d),
+        .core_rsp_excpt_d      (core_rsp_excpt_d),
+        .core_rsp_id_d         (core_rsp_id_d),
+        .core_rsp_ctrl_signals_d (core_rsp_ctrl_signals_d)
     );
 
     // i-cache fixed signals (request/cancel now come from the core's IIU)
@@ -141,17 +164,6 @@ module riscv_core_interface (
     assign core_req_store_data_i = 32'h0;
     assign mem_req_store_mask_i  = 4'b0000;
     assign mem_req_store_data_i  = 32'h0;
-
-    // d-cache fixed signals — LightningCore has no memory unit yet, so the
-    // D-side is tied off idle; the controller stays instantiated to keep
-    // the seam warm for the memory unit.
-    assign core_req_re_d         = 1'b0;
-    assign core_req_addr_d       = '0;
-    assign core_req_store_mask_d = 4'b0000;
-    assign core_req_store_data_d = 32'h0;
-    assign core_req_stall_mem_d  = 1'b0;
-    assign core_req_we_d         = (core_req_store_mask_d != 4'b0000);
-    assign core_req_cancel_d     = 1'b0;
 
     cache_controller2 #(
         .INDEX_BITS         (INSTR_CACHE_INDEX_BITS),
@@ -171,11 +183,15 @@ module riscv_core_interface (
         .core_req_store_data    (core_req_store_data_i),
         .core_req_cancel        (core_req_cancel_i),
         .core_req_stall_mem     (core_req_stall_mem_i),
+        .core_req_id            (6'hF), // i-cache requests don't have an ID
+        .core_req_ctrl_signals  ('h0), // i-cache requests don't have control signals
         .core_rsp_addr          (core_rsp_addr_i),
         .core_rsp_data          (core_rsp_data_i),
         .core_rsp_data_valid    (core_rsp_data_valid_i),
         .core_rsp_ready         (core_rsp_ready_i),
         .core_rsp_excpt         (core_rsp_excpt_i),
+        .core_rsp_ctrl_signals  (), // i-cache responses don't have control signals
+        .core_rsp_id            (), // i-cache responses don't have an ID
         .mem_rsp_data           (mem_rsp_data),
         .mem_rsp_valid          (mem_rsp_valid),
         .mem_rsp_addr           (mem_rsp_addr),
@@ -207,11 +223,15 @@ module riscv_core_interface (
         .core_req_store_data    (core_req_store_data_d),
         .core_req_cancel        (core_req_cancel_d),
         .core_req_stall_mem     (core_req_stall_mem_d),
+        .core_req_id            (core_req_id_d),
+        .core_req_ctrl_signals  (core_req_ctrl_signals_d),
         .core_rsp_addr          (core_rsp_addr_d),
         .core_rsp_data          (core_rsp_data_d),
         .core_rsp_data_valid    (core_rsp_data_valid_d),
         .core_rsp_ready         (core_rsp_ready_d),
         .core_rsp_excpt         (core_rsp_excpt_d),
+        .core_rsp_id            (core_rsp_id_d),
+        .core_rsp_ctrl_signals  (core_rsp_ctrl_signals_d),
         .mem_rsp_data           (mem_rsp_data),
         .mem_rsp_valid          (mem_rsp_valid),
         .mem_rsp_addr           (mem_rsp_addr),

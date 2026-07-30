@@ -42,6 +42,11 @@
  *                           one word (beat) per cycle.
  */
 
+import DRIS_defs::*;
+import RISCV_ISA::*;
+import RISCV_UArch::*;  // Import microarchitecture parameters and definitions
+import internal_defines_pkg::*;     // Control signals struct, ALU ops
+
 module cache_controller2 #(
     parameter INDEX_BITS        = 4,
     parameter BLOCK_OFFSET_BITS = 2,
@@ -62,12 +67,16 @@ module cache_controller2 #(
     input  logic [WORD_SIZE-1:0]          core_req_store_data,
     input  logic                          core_req_cancel,
     input  logic                          core_req_stall_mem,
+    input dris_id_t                      core_req_id,
+    input ctrl_signals_t                  core_req_ctrl_signals,
     // Core-facing response
     output logic [ADDRESS_SIZE-1:0]       core_rsp_addr,
     output logic [FETCH_WORDS-1:0][WORD_SIZE-1:0] core_rsp_data,
     output logic                          core_rsp_data_valid,
     output logic                          core_rsp_ready,
     output logic                          core_rsp_excpt,
+    output dris_id_t                      core_rsp_id,
+    output ctrl_signals_t                 core_rsp_ctrl_signals,
 
     // Memory-facing response
     input  logic [BLOCK_SIZE-1:0][WORD_SIZE-1:0] mem_rsp_data,
@@ -106,6 +115,8 @@ module cache_controller2 #(
     // Copy of the accepted request the FSM is currently working on. Doubles as
     // the miss-address latch matched against mem_rsp_addr during fills.
     logic [ADDRESS_SIZE-1:0]       core_req_addr_latched;
+    dris_id_t                      core_req_id_latched;
+    ctrl_signals_t                  core_req_ctrl_signals_latched;
     logic [3:0]                    core_req_store_mask_latched;
     logic [WORD_SIZE-1:0]          core_req_store_data_latched;
 
@@ -438,7 +449,8 @@ module cache_controller2 #(
     // (core_req_stall_mem), so a 1-cycle hit/fill pulse is never lost, and
     // flush drops in-flight responses on a redirect.
     logic                                              fifo_enable;
-    logic [FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE : 0]   fifo_data;  // {valid, data, addr}
+    logic [FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE + $bits(dris_id_t) + $bits(ctrl_signals_t) : 0]
+    fifo_data;  // {valid, data, addr}
 
     // Read-miss fill-forward: slice FETCH_WORDS words out of the fill block
     // starting at the requested offset, clamped at the block end — the same
@@ -465,10 +477,14 @@ module cache_controller2 #(
     end
 
     assign fifo_enable = core_hit_valid | do_forward | do_forward_saved;
-    assign fifo_data   = {1'b1, rsp_words, core_req_addr_latched};
+    assign fifo_data   = {1'b1, rsp_words, core_req_addr_latched, core_req_id_latched, core_req_ctrl_signals_latched};
+
+    // always_ff @(posedge clk, negedge rst_l) begin
+    //     $display($time, "cache_controller2: fifo_data=%b, fifo_enable=%b, core_req_id_latched=%h", fifo_data, fifo_enable, core_req_id_latched);
+    // end
 
     fifo #(
-        .WIDTH       (1 + FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE),
+        .WIDTH       (1 + FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE + $bits(dris_id_t) + $bits(ctrl_signals_t)),
         .MAX_ELEMENTS(2)
     ) feefifofum (
         .clk, .rst_l,
@@ -477,7 +493,7 @@ module cache_controller2 #(
         .enq_data   (fifo_data),
         .num_enq    (fifo_enable),
         .num_deq    (1'b1),
-        .deq_data   ({core_rsp_data_valid, core_rsp_data, core_rsp_addr}),
+        .deq_data   ({core_rsp_data_valid, core_rsp_data, core_rsp_addr, core_rsp_id, core_rsp_ctrl_signals}),
         .num_suc_enq(),
         .num_suc_deq(),
         .num_q_elem ()
@@ -530,11 +546,15 @@ module cache_controller2 #(
     always_ff @(posedge clk, negedge rst_l) begin: in_process_request_register
         if (~rst_l) begin
             core_req_addr_latched       <= '0;
+            core_req_id_latched         <= '0;
+            core_req_ctrl_signals_latched <= '0;
             core_req_store_mask_latched <= '0;
             core_req_store_data_latched <= '0;
         end
         else if (core_req_bus_wait_en) begin
             core_req_addr_latched       <= core_req_addr;
+            core_req_id_latched         <= core_req_id;
+            core_req_ctrl_signals_latched <= core_req_ctrl_signals;
             core_req_store_mask_latched <= core_req_store_mask;
             core_req_store_data_latched <= core_req_store_data;
         end

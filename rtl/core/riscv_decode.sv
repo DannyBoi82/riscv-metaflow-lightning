@@ -87,7 +87,7 @@ module riscv_decode
     // The destination and source registers for the instruction
     assign rd  = instr[11:7];
     assign rs1 = (ctrl_signals.syscall) ? 5'd10 : instr[19:15];
-    assign rs2 = instr[24:20];
+    assign rs2 = (ctrl_signals.syscall) ? 5'd10 : instr[24:20];
 
     always_comb begin
         ctrl_signals = '{
@@ -435,7 +435,9 @@ module riscv_decode
                 unique case (itype_funct12)
                     FUNCT12_ECALL: begin
                         ctrl_signals.uses_rs1 = 1'b1;
+                        ctrl_signals.uses_rs2 = 1'b1;
                         ctrl_signals.syscall = 1'b1;
+                        ctrl_signals.alu_op = ALU_PASS;
                     end
 
                     default: begin

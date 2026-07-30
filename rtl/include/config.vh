@@ -60,7 +60,7 @@
 
 // DRIS (Deferred-scheduling Register Instruction Shelf) entries
 `ifndef LTG_DRIS_ENTRIES
-`define LTG_DRIS_ENTRIES 64
+`define LTG_DRIS_ENTRIES 32
 `endif
 
 // Instructions fetched/renamed per cycle
@@ -85,7 +85,7 @@
 
 // Memory read ports (for load-store queue; sizes the writeback array)
 `ifndef LTG_MEMORY_READ_PORTS
-`define LTG_MEMORY_READ_PORTS 2
+`define LTG_MEMORY_READ_PORTS 1
 `endif
 
 // Branches in flight at once (sizes branch mask in issue unit and predictor)

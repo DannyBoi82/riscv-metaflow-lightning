@@ -33,13 +33,16 @@ structure changes.
   (or documented). Final blessing = `make regress SIM=vcs` on AFS.
 - The Verilator binary is a **v5.048 -O1 build** (`VERILATOR` in config.mk);
   stock -O3 builds segfault on this design (GCC 13.3 miscompile).
-- Expected failures today (CORE=lightning): load/store/mul asm tests,
-  syscalltest (Lightning halts on any syscall at the retire head), and all
-  tests/c, tests/perf (no memory unit; nobody implements M yet).
-  Passing set = ALU/branch/jump asm tests. CORE=inorder passes everything
-  except the 3 mul tests. Don't "fix" the others by touching the harness —
-  the harness is blessed against the in-repo in-order core (`CORE=inorder`,
-  formerly the `~/lab4b-vl` rig, see porting log).
+- Expected failures today (CORE=lightning, `make regress SIM=vcs` over
+  tests/asm): the 3 mul tests (nobody implements M — not even the refsim)
+  and `memtest2` (completes, wrong result — the known memory-unit bug).
+  Everything else in tests/asm passes, loads/stores and syscalltest
+  included, since the memory unit landed 2026-07-30. In tests/c, `fibi.c`
+  passes and `fibm.c` hangs (the watchdog catches it; it hung before the
+  port too). CORE=inorder passes everything except the same 3 mul tests.
+  Don't "fix" failures by touching the harness — the harness is blessed
+  against the in-repo in-order core (`CORE=inorder`, formerly the
+  `~/lab4b-vl` rig, see porting log).
 - tests/c and tests/perf `.reg` oracles are class-toolchain-coupled
   (caller-saved register residue). Local GCC ≠ class GCC ⇒ residue diffs,
   not bugs.

@@ -55,6 +55,8 @@ module Scheduler #(
             assign ready_vector[ready_check_genvar] =
              entries_checked[ready_check_genvar].entry_state.valid &&
             !entries_checked[ready_check_genvar].entry_state.dispatched &&
+            !entries_checked[ready_check_genvar].entry_state.executed &&
+            !entries_checked[ready_check_genvar].entry_state.mem_addr_ready &&
             !entries_checked[ready_check_genvar].locker_1.locked &&
             !entries_checked[ready_check_genvar].locker_2.locked;
         end
