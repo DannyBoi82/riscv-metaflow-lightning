@@ -276,7 +276,9 @@ only at retirement.
   instantiation, `delay_buffer` (DMEMORY_READ_DELAY-cycle memory latency),
   `main_memory`, cycle/mem-access counters, `$finish` on `halted`,
   watchdog `$finish` + TIMEOUT print past MAX_SIM_CYCLES (livelocked cores
-  otherwise log forever), Verilator-only `+waves` FST dump block.
+  otherwise log forever; the register dump is still written, and the
+  Makefile keys off the TIMEOUT line to fail `verify`), Verilator-only
+  `+waves` FST dump block.
 - `main_memory.sv` — behavioral memory: flat per-segment byte-lane arrays,
   loads `mem.{text,data,ktext,kdata}.bin` at time 0, word-wide load port
   (MEMORY_READ_WIDTH words per response), byte-masked stores (store_data
@@ -298,7 +300,10 @@ only at retirement.
   anchor line, and the end-of-run `simulation.reg`/`simulation.reg2`/
   stdout dump — **the dump comes from the shadow**, so `make verify`
   depends on faithful commit packets (shadow-vs-flops cross-check is a
-  planned guard, see TODO-verify-trace.md).
+  planned guard, see TODO-verify-trace.md). The dump fires on the halt
+  edge; a `final` block (guarded by a `dumped` flag) covers a run that
+  ends any other way, so a watchdog-killed run still leaves a
+  `simulation.reg` to look at.
 
 ## tools/refsim — C instruction-level reference simulator
 
@@ -347,7 +352,10 @@ rd==rs1 — see porting log). RV32I only, no M — mul tests can't be oracled.
 ## Verification flows
 
 1. **End-state** (`make verify TEST=...`): run to halt, dump all 32
-   registers (`simulation.reg`), sdiff vs `<test>.reg` oracle.
+   registers (`simulation.reg`), sdiff vs `<test>.reg` oracle. A run the
+   watchdog cuts off still dumps (state at the cutoff, for debugging) but
+   is failed outright — verify greps the sim log for `TIMEOUT:` before
+   diffing, so a livelock can never be reported as a pass.
 2. **verify-trace** (`make verify-trace TEST=...`): per-commit full-state
    trace compare vs refsim — blessed on the in-order core (full asm suite
    + fault-injection check, 2026-07-11) and green on Lightning since the

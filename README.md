@@ -115,6 +115,11 @@ strips), so a plain build just gives a less chatty divergence report.
   cores, `make verify` and `make verify-trace` alike. The harness itself is
   validated end-to-end against a known-good in-order core (see
   `docs/porting-log.md`, 2026-07-07).
+- A run that never reaches its halting ecall is cut off by the
+  `LTG_MAX_SIM_CYCLES` watchdog. It still writes `simulation.reg` — the
+  architectural state at the cutoff, which is the useful thing to look at —
+  but `make verify` fails it on the `TIMEOUT:` line in the sim log rather
+  than diffing, so a livelock can't be mistaken for a pass.
 - `tests/c` / `tests/perf` `.reg` oracles are coupled to the class
   toolchain's codegen (register residue); with a different compiler,
   regenerate oracles before trusting failures.

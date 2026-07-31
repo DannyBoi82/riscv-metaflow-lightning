@@ -70,7 +70,10 @@ structure changes.
   Verilator-only C++ harness, no VCS-only constructs outside `ifdef guards.
 - A watchdog `$finish`es runs after `LTG_MAX_SIM_CYCLES` (livelocked cores
   otherwise log forever); the Makefile deletes stale `simulation.reg` before
-  each run — keep both if you rework the sim flow.
+  each run — keep both if you rework the sim flow. A timed-out run *does*
+  write its register dump (commit_verifier `final` block, state at the
+  cutoff); `verify` fails it by grepping the sim log for `TIMEOUT:`, so
+  don't rely on a missing dump to fail a run.
 - Lint waivers: prefer fixing RTL; else document in `lint.vlt` (global rules
   there don't always catch elaboration-stage warnings — those need inline
   `// verilator lint_off` metacomments; see porting log).

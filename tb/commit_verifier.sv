@@ -18,7 +18,9 @@
  *    so a reset-state mismatch is caught at commit 0.
  *  - At halt: the end-of-run register dump (stdout + simulation.reg +
  *    simulation.reg2), from the shadow state *including* any commits that
- *    land on the halt edge itself.
+ *    land on the halt edge itself. A run that ends *without* halting (the
+ *    watchdog) still gets its dump, from a `final` block, so `make verify`
+ *    always has a register state to diff — see the note there.
  *
  * Everything here is print-side only: no simulation time is consumed, so
  * cycle counts and perf counters are unaffected (the cost is wall clock
@@ -80,6 +82,12 @@ module commit_verifier
     // Commit trace file; 0 when tracing is disabled
     int trace_fd = 0;
 
+    /* Set once the end-of-run dump has been written, so the `final` fallback
+     * below doesn't dump a second time over a normal halting run. Cleared in
+     * reset rather than at declaration: VCS counts a declaration initializer
+     * as a second driver and rejects it. */
+    logic dumped;
+
     initial begin : trace_setup
         logic [NUM_REGS-1:0][XLEN-1:0] anchor;
         if ($test$plusargs("commit_trace")) begin
@@ -92,15 +100,27 @@ module commit_verifier
         end
     end : trace_setup
 
+    /* The dump normally happens on the halt edge below. This is the fallback
+     * for a run that ends some other way — in practice the watchdog killing a
+     * core that never reached its halting ecall. Without it there is no
+     * simulation.reg at all and `make verify` can only report a missing file;
+     * with it you get the architectural state at the cutoff, which is what
+     * you actually want to look at. `shadow` (not `upd`) is the state as of
+     * the last completed clock edge. The Makefile fails a timed-out run
+     * regardless of how that state compares — see `verify`. */
     final begin
         if (trace_fd != 0) begin
             $fclose(trace_fd);
+        end
+        if (!dumped) begin
+            dump_registers(shadow);
         end
     end
 
     always_ff @(posedge clk, negedge rst_l) begin
         if (!rst_l) begin
             shadow <= reset_state();
+            dumped = 1'b0;
         end
         else begin
             upd = shadow;
@@ -123,6 +143,9 @@ module commit_verifier
              * and file. Uses upd, not shadow: a commit landing on the halt
              * edge itself must be part of the dump. */
             if (halted) begin
+                /* Blocking, like upd above: the `final` fallback must see
+                 * this before it runs, and it is the only driver. */
+                dumped = 1'b1;
                 dump_registers(upd);
             end
 

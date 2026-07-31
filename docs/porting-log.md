@@ -493,6 +493,56 @@ Guard against re-rot: DEBUG is not in any regress path, so it can only
 break silently. If you touch the OoO packet structs, do one
 `make build SIM=vcs PARAMS='+define+DEBUG'`.
 
+## 2026-07-31 (later): `make verify` on a run that never halts
+
+The register dump was only ever written on the halt edge
+(`commit_verifier.sv`, and `register_file.sv` before it — the pre-port repo
+did the same). A run the watchdog kills therefore produced **no**
+`simulation.reg` at all, and `verify` could only report
+
+```
+diff: output/vcs/simulation.reg: No such file or directory
+Incorrect! The simulator register dump does not match the reference.
+```
+
+which says nothing about what the core actually did. That is the failure
+mode on every livelock: the 3 mul tests, `tests/c/fibm.c`, and any core bug
+that stalls retirement. (verify-trace never had the problem — its checker
+reads a truncated trace and reports "the RTL trace ended early".)
+
+Fix, in three parts:
+
+- `commit_verifier.sv`: a `final` block dumps `shadow` if the halt-edge dump
+  never ran, gated on a `dumped` flag. So every run ends with a
+  `simulation.reg`, and on a timeout it is the architectural state at the
+  cutoff — the thing you want to diff against the oracle to see how far the
+  program got.
+- `tb/testbench.sv`: watchdog comment updated (it used to assert that no
+  dump is produced, which was the mechanism that failed verify).
+- `Makefile`: `verify` greps the sim log for `^TIMEOUT:` before diffing and
+  fails outright if it matches. **This is load-bearing** — without it, a
+  core that computes everything and then livelocks before its ecall retires
+  would dump correct-looking registers and be reported as a pass. The
+  missing file used to provide that guarantee; the grep replaces it.
+
+Two VCS gotchas hit while writing the flag, both "multiple drivers" errors
+on a plain `logic`:
+
+- Calling `dump_registers()` from both the `always_ff` and the `final` block
+  makes VCS count each call site as a driver of anything the function
+  assigns. Hence the flag is set at the call site, not inside the function.
+- `logic dumped = 1'b0;` — VCS counts the declaration initializer as a
+  second driver alongside the `always_ff`. Cleared in the reset branch
+  instead. (`int trace_fd = 0;` gets away with it because its other
+  assignment is in an `initial` block.)
+
+Verified under VCS, `CORE=lightning` and `CORE=inorder`: `make regress
+TESTS='tests/asm/*.S'` unchanged at 3 failures (the mul tests, now failing
+with the timeout message and a dump to inspect), `make verify` still green
+on `tests/asm` + `tests/c/fibi.c` incl. `PARAMS='+define+DEBUG'`, exactly
+one register dump per run (no double dump on normal halts), and
+`make verify-trace` unaffected.
+
 ## 2026-08-07: perf benchmarks — `RISCV_ARCH=rv32im` was leaking into C
 
 `tests/perf/*` produced wrong results on **both** cores, including the

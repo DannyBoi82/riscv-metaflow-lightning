@@ -405,6 +405,13 @@ endif
 verify: $(SIM_REGDUMP) $(REF_REGDUMP) | assemble verify-check-ref-regdump \
 		check-test-defined
 	@printf "\n"
+	@if grep -q '^TIMEOUT:' $(OUTPUT)/$(SIM_LOG) 2> /dev/null; then \
+		printf "$rIncorrect! The core never halted — the watchdog cut the "; \
+		printf "run off after $bLTG_MAX_SIM_CYCLES$n$r cycles. The dump at "; \
+		printf "$u$(SIM_REGDUMP)$n$r is its architectural state at the "; \
+		printf "cutoff, not a finished program.$n\n"; \
+		exit 1; \
+	fi
 	@if $(VERIFY_SCRIPT) $(VERIFY_OPTIONS) $^ &> /dev/null; then \
 		printf "$gCorrect! The simulator register dump matches the "; \
 		printf "reference.$n\n"; \

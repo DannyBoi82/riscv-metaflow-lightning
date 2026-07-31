@@ -185,8 +185,10 @@ module top;
     end
 
     /* Watchdog: a test that never reaches its halting ecall (e.g. the core
-     * livelocks) would otherwise simulate — and print — forever. No register
-     * dump is produced, so verify fails as it should. */
+     * livelocks) would otherwise simulate — and print — forever. The register
+     * dump is still produced (commit_verifier's `final` block) so there is
+     * something to look at, and the Makefile keys off this TIMEOUT line to
+     * fail the run however that state happens to compare. */
     always @(posedge clk) begin
         if (rst_l && cycle_count >= MAX_SIM_CYCLES) begin
             $display("TIMEOUT: %0d cycles elapsed without the core halting.",
