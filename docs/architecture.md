@@ -6,7 +6,7 @@ doesn't have to re-explore the tree. Companion docs: `docs/porting-log.md`
 `docs/TODO-verify-trace.md` (commit-trace design), `docs/TODO-IIU.md`,
 `docs/new-repo.md` (original migration plan), `docs/TODO-memory.md` (memory
 unit design + working notes), `docs/memorable-bugs.md`. Last updated:
-2026-07-30.
+2026-07-31.
 
 ## Big picture
 
@@ -15,8 +15,9 @@ Two RISC-V RV32I cores share one simulation harness and one build system:
 - **Lightning** (`rtl/ooo/`, `CORE=lightning`, default) — the OoO
   DRIS/Metaflow-style core being built. The memory unit (`MemoryScheduler`
   + the D-side cache seam) landed 2026-07-30, so loads and stores now
-  work: 53/57 `tests/asm` pass, the exceptions being the 3 mul tests (no M
-  extension anywhere) and `memtest2` (runs to completion, wrong result).
+  work: all of `tests/asm` passes except the 3 mul tests (no M extension
+  anywhere), under `make verify` and `make verify-trace` alike — the
+  commit seam landed 2026-07-31.
 - **In-order core** (`rtl/core/riscv_core.sv`, `CORE=inorder`) — the blessed
   8-stage class core (passes the full autograder suite). Used as a known-good
   rig for harness work (e.g. the verify-trace flow) so harness bugs are never
@@ -210,8 +211,18 @@ only at retirement.
   - Exec stage is a real pipeline stage — never clear `issue_pkts_reg` on
     flush (older in-flight instructions must complete). `halted` =
     trapping entry (halting ecall / illegal) reaching the retire head.
-    Exposes a write-only `commit_pkts` port — TODO(SSC): populate once the
-    SSC carries pc/insn and non-writing retirements.
+  - **The commit seam** (bottom of the file): drives `commit_pkts` for
+    verify-trace. The SSC's `reg_commits` can't source them (no pc, and
+    no packet at all for a retirement that writes no register), so slot
+    s's valid/pc come straight off the retirement seam — `retire_vector`
+    indexed at `retire_ptr + s`, the inverse of the SSC's scatter — while
+    `register_file` fills the register-write half from write port s, the
+    same slot. `insn` is reported only in `DEBUG builds (that is when the
+    DRIS entry keeps the instruction word; it is a stripped comment field
+    in the trace, so the diff does not depend on it). A halting
+    ecall never retires, so `halted` forces one final packet at slot 0
+    (pc = `trap_pc`, no register write) to match the refsim, which does
+    execute it.
 - `SaneStateController.sv` — retirement: walks the DRIS from the retire
   pointer, retires completed entries in program order up to the branch
   fence, drives `reg_commits` to the regfile write ports (highest way =
@@ -337,21 +348,21 @@ rd==rs1 — see porting log). RV32I only, no M — mul tests can't be oracled.
 
 1. **End-state** (`make verify TEST=...`): run to halt, dump all 32
    registers (`simulation.reg`), sdiff vs `<test>.reg` oracle.
-2. **verify-trace** (`make verify-trace TEST=... CORE=inorder`):
-   per-commit full-state trace compare vs refsim — blessed on the
-   in-order core (full asm suite + fault-injection check, 2026-07-11).
-   Lightning emits write-only packets (end-state dump works;
-   verify-trace blocked on SSC pc/insn + non-writing retirements). See
-   README "verify-trace" for the flow and the commit-packet contract,
-   `docs/TODO-verify-trace.md` for design rationale + remaining items.
+2. **verify-trace** (`make verify-trace TEST=...`): per-commit full-state
+   trace compare vs refsim — blessed on the in-order core (full asm suite
+   + fault-injection check, 2026-07-11) and green on Lightning since the
+   commit seam landed 2026-07-31 (all of `tests/asm` bar the mul tests,
+   plus `tests/c/fibi.c` at 22.5k commits). See README "verify-trace" for
+   the flow and the commit-packet contract, `docs/TODO-verify-trace.md`
+   for design rationale + remaining items.
 3. **Ground truth**: VCS on AFS is the semantics oracle. Expected
-   failures as of 2026-07-30 (`make regress SIM=vcs`, full `tests/asm`):
-   - **lightning** — 53/57. `multest`, `dependMul`, `dependMulLow` (no M
-     extension anywhere, refsim included) and `memtest2` (runs to
-     completion, wrong result — the one known memory-unit bug). Loads,
-     stores, and `syscalltest` all pass since the memory unit landed.
-     `tests/c/fibi.c` passes; `tests/c/fibm.c` hangs (watchdog fires) —
-     same behavior as the pre-port repo, not a regression.
+   failures as of 2026-07-31 (`make regress SIM=vcs`, full `tests/asm`):
+   - **lightning** — 53/56: only `multest`, `dependMul`, `dependMulLow`
+     fail (no M extension anywhere, refsim included), and they fail the
+     same way under verify-trace. Loads, stores, `memtest2` and
+     `syscalltest` all pass. `tests/c/fibi.c` passes; `tests/c/fibm.c`
+     hangs (watchdog fires) — same behavior as the pre-port repo, not a
+     regression.
    - **inorder** — everything except the same 3 mul tests.
 
 ## Lookup reference (fine-grained pointers found the hard way)
@@ -361,8 +372,9 @@ rd==rs1 — see porting log). RV32I only, no M — mul tests can't be oracled.
   `stall_W = EMW_stall`. Halt detection (`syscall_halt`/`halted`) is just
   below it. Commit seam (`commit_fire`, rf_commit_* wiring) sits between
   the writeback mux and STALL & FLUSH CONTROL.
-- Lightning regfile write wiring (`rf_we` from SSC `reg_commits`) +
-  commit-packet tie-off: bottom of `LightningCore.sv` (rf instantiation).
+- Lightning regfile write wiring (`rf_we` from SSC `reg_commits`) and the
+  commit seam (`retire_slot_index`, `commit_seam`, `commit_pkt_padding`):
+  bottom of `LightningCore.sv`, around the rf instantiation.
 - Memory path, in dispatch order: address phase is an ordinary
   `Scheduler.sv` dispatch; the AGU-pass special case is in `DRIS.sv`'s
   writeback loop (`mem_addr_ready` branch); phase-2 selection is

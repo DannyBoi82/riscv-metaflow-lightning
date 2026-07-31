@@ -10,9 +10,11 @@ structure changes.
 ## Commands
 
 - `make verify TEST=tests/asm/additest.S` — build, run, diff vs `.reg` oracle
-- `make verify-trace TEST=... CORE=inorder` — per-commit architectural state
-  compare vs refsim; first divergent commit reported with pc/insn/regs/cycle
-  (README "verify-trace"; lightning can't run it yet — SSC lacks retire info)
+- `make verify-trace TEST=...` — per-commit architectural state compare vs
+  refsim; first divergent commit reported with pc/insn/regs/cycle (README
+  "verify-trace"). Works on both cores; on lightning the `insn` annotation
+  needs `PARAMS='+define+DEBUG'` (the DRIS keeps the instruction word only
+  in DEBUG builds) — nothing diffs against that field either way
 - `CORE=lightning|inorder` (config.mk) — which core the harness wraps; the
   in-order class core is the known-good rig for harness work
 - `make regress TESTS='tests/asm/*.S'` — suite; omit TESTS for everything
@@ -25,6 +27,10 @@ structure changes.
   test. RV32I only (no M): mul tests can't be oracled with it.
 - Hardware knobs: `LTG_*` in `rtl/include/config.vh`, overridden per run via
   `PARAMS='+define+LTG_...=N'`. Build knobs: `config.mk`.
+- `PARAMS='+define+DEBUG'` adds the debug pc/instruction fields to the OoO
+  packets and DRIS entries (waveform readability + `insn` in commit
+  packets). It builds and passes the same tests as a normal build; keep it
+  that way — it silently rotted before (2026-07-31 porting-log entry).
 
 ## Ground truth
 
@@ -34,12 +40,12 @@ structure changes.
 - The Verilator binary is a **v5.048 -O1 build** (`VERILATOR` in config.mk);
   stock -O3 builds segfault on this design (GCC 13.3 miscompile).
 - Expected failures today (CORE=lightning, `make regress SIM=vcs` over
-  tests/asm): the 3 mul tests (nobody implements M — not even the refsim)
-  and `memtest2` (completes, wrong result — the known memory-unit bug).
-  Everything else in tests/asm passes, loads/stores and syscalltest
-  included, since the memory unit landed 2026-07-30. In tests/c, `fibi.c`
-  passes and `fibm.c` hangs (the watchdog catches it; it hung before the
-  port too). CORE=inorder passes everything except the same 3 mul tests.
+  tests/asm): the 3 mul tests, and only those (nobody implements M — not
+  even the refsim). Everything else passes, loads/stores, `memtest2` and
+  syscalltest included; the same 53 also pass `make verify-trace`. In
+  tests/c, `fibi.c` passes (verify and verify-trace) and `fibm.c` hangs
+  (the watchdog catches it; it hung before the port too). CORE=inorder
+  passes everything except the same 3 mul tests.
   Don't "fix" failures by touching the harness — the harness is blessed
   against the in-repo in-order core (`CORE=inorder`, formerly the
   `~/lab4b-vl` rig, see porting log).

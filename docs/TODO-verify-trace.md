@@ -1,6 +1,8 @@
 # TODO — verify-trace redesign (commit-state trace compare)
 
-**Status 2026-07-11 (end of day): LANDED and blessed on CORE=inorder.**
+**Status 2026-07-31: LANDED on both cores** (blessed on CORE=inorder
+2026-07-11, extended to CORE=lightning 2026-07-31 — see the last work
+item).
 `make verify-trace TEST=... CORE=inorder` works end-to-end: full asm suite
 passes (17 representative tests trace-verified incl. memtest0-2/depend;
 full regress green except the 3 expected mul tests), and an injected ALU
@@ -192,9 +194,19 @@ both sides agree that the dump point is "one committed instruction."
 - [x] sanity cross-check "final trace line == end-of-run dump": true by
       construction now — both are produced from the same shadow state in
       commit_verifier.
-- [ ] lightning: SSC must carry pc/insn and non-writing retirements into
-      reg_commits so verify-trace works on CORE=lightning (write-only
-      packets today; see TODO(SSC) in LightningCore.sv).
+- [x] lightning: full commit packets (*done 07-31*). The SSC did **not**
+      need to change: `retire_vector` + `retire_ptr` + the DRIS entries
+      already carry everything, so LightningCore's commit seam drives
+      `commit_valid`/`commit_pc` per retire slot (slot s = entry at
+      `retire_ptr + s`, the inverse of the SSC's scatter) and the regfile
+      pairs them with write port s as on the in-order core. Non-writing
+      retirements now report (rd_addr = 0), and `halted` forces a final
+      packet for the halting ecall, which traps instead of retiring.
+      `insn` is reported in `DEBUG builds only (`PARAMS='+define+DEBUG'`,
+      which is when the DRIS entry keeps the instruction word); the field
+      lives inside the `#` comment the checker strips, so the diff never
+      depends on it. Green on the full asm suite and tests/c/fibi.c under
+      SIM=vcs, DEBUG and non-DEBUG alike.
 - [x] VCS parity (*done 07-11 on the lab machine*): verify-trace green under
       `SIM=vcs` (additest, memtest0-2, depend, brtest0/2, syscalltest;
       asm regress matches Verilator: all pass except the 3 mul tests).

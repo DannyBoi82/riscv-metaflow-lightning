@@ -421,6 +421,78 @@ anywhere — the reset window contains no clock edge by design.
   on this design (same species as the documented GCC-miscompile
   segfaults — needs a -O1 rebuild if Verilator is wanted here).
 
+## 2026-07-31: verify-trace on CORE=lightning (the commit seam)
+
+Lightning was still emitting the port-era stand-in commit packets —
+`register_file`'s `commit_valid` tied to its own write enables, pc/insn
+0 — which is all the *old* repo's verification ever needed (an
+end-of-run register dump), but not what this harness consumes: the
+commit_verifier's shadow regfile *is* the dump, and verify-trace needs
+one packet per **retired instruction**, writing or not, with its PC.
+
+Fix, entirely inside `LightningCore.sv` (the SSC did not have to
+change): slot s of the commit array is the DRIS entry at
+`retire_ptr + s` — the inverse of the SSC's `retire_vector_scatter` —
+so `commit_valid[s] = retire_vector[retire_slot_index(s)]` and
+`commit_pc[s]` is that entry's pc. The regfile still assembles the
+packets from write port s, which belongs to the same retire slot
+(`reg_commits[s]`), so the two halves stay aligned and x0/non-writing
+retirements come out as `rd_addr = 0` for free.
+
+Two things that are easy to get wrong:
+
+- **The halting ecall never retires.** The SSC traps on it at the retire
+  head instead — that is what raises `halted` — so no retire slot ever
+  reports it, while the refsim executes it and prints a final trace line.
+  `halted` therefore forces one last packet at slot 0 (pc = `trap_pc`,
+  no register write), the same thing the in-order core does with
+  `valid_W & (~stall_W | halted)`. Slot 0 is guaranteed free: nothing
+  retires in a cycle whose head entry has trapped.
+- **`insn` is reported only in `DEBUG builds**, since that is when the
+  DRIS entry carries an instruction word (see the DEBUG section below).
+  Nothing diffs against the field — it lives inside the `#` comment
+  `check_commit_trace.py` strips — so a plain build just gives a less
+  chatty divergence report; pc identifies the instruction either way.
+
+Result under `SIM=vcs`: `make verify-trace` green on all of `tests/asm`
+except the 3 mul tests (which no core and not the refsim implement), and
+on `tests/c/fibi.c` — 22507 commits matching the reference. `make regress
+TESTS='tests/asm/*.S'` unchanged (same 3 failures); VCS compile warning
+count unchanged at 49. Verilator lint was *not* run: there is still no
+usable verilator on this lab machine (see Environment notes above).
+
+Doc drift found while updating: `memtest2` had been fixed by the last
+commit before this one but was still listed as an expected failure in
+CLAUDE.md/architecture.md, and README still described Lightning as having
+no memory unit. Both corrected.
+
+### `+define+DEBUG` had rotted (fixed the same day)
+
+The OoO packets/entries carry `ifdef DEBUG pc/instruction fields for
+waveform readability. Nobody had built with `DEBUG` in a long time and it
+no longer compiled — the guarded code referenced members that don't exist:
+
+- `DRIS.sv` writeback: `dris_entries[...].debug_pc <=
+  writeback_pkts[i].debug_pc_dris_W` — neither member exists. Deleted the
+  whole debug writeback block rather than adding the fields: intake
+  already stores pc and the instruction word, and copying them back from
+  the writeback packet would *clear* them for loads, whose data writeback
+  is driven straight from the cache response (`writeback_pkts[EXEC_UNITS]`
+  in LightningCore) and carries no instruction word.
+- `SaneStateController.sv`: `entries_checked[i].instr` — the member is
+  `debug_instr`.
+
+With those two fixed, `PARAMS='+define+DEBUG'` builds and runs identically
+to a normal build: same `make regress` result over `tests/asm` (the 3 mul
+tests), `make verify-trace` green on the same 53 + `tests/c/fibi.c`, on
+`CORE=lightning` and `CORE=inorder`, and the same 49 VCS compile warnings.
+The payoff for verify-trace: a DEBUG build fills in the commit packet's
+`insn`, so the divergence report names the instruction, not just its pc.
+
+Guard against re-rot: DEBUG is not in any regress path, so it can only
+break silently. If you touch the OoO packet structs, do one
+`make build SIM=vcs PARAMS='+define+DEBUG'`.
+
 ## 2026-08-07: perf benchmarks — `RISCV_ARCH=rv32im` was leaking into C
 
 `tests/perf/*` produced wrong results on **both** cores, including the

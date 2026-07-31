@@ -30,7 +30,7 @@ lightning/
 
 ```
 make verify TEST=tests/asm/additest.S      # build + run + diff vs oracle
-make verify-trace TEST=... CORE=inorder    # per-commit state compare (below)
+make verify-trace TEST=...                 # per-commit state compare (below)
 make regress TESTS='tests/asm/*.S'         # regression over a glob
 make waves TEST=...                        # FST + gtkwave (SIM=vcs: DVE)
 make lint                                  # verilator --lint-only -Wall, clean
@@ -60,7 +60,7 @@ automatically when PARAMS change. Build knobs live in `config.mk`.
 
 ## verify-trace: per-commit state compare
 
-`make verify-trace TEST=... CORE=inorder` compares **full architectural
+`make verify-trace TEST=...` compares **full architectural
 register state after every committed instruction** against the reference
 simulator, and reports the first divergent commit with its PC, instruction,
 differing registers, and RTL retire cycle (jump there with `make waves`).
@@ -96,16 +96,23 @@ unaffected**. The price is wall-clock and disk (~300 B per commit, so
 ~300 MB per million commits; the `LTG_MAX_SIM_CYCLES` watchdog bounds
 livelocked traces).
 
-Status: blessed on `CORE=inorder` (full asm suite). `CORE=lightning`
-currently emits write-only packets (no pc/insn, no non-writing
-retirements) — enough for the end-state dump, but `verify-trace` needs
-the SSC to emit full retire info (see `docs/TODO-verify-trace.md`).
+Status: green on both cores over the full `tests/asm` suite (the 3 mul
+tests excepted — no M extension anywhere, refsim included), and on
+`tests/c/fibi.c` (22.5k commits) for `CORE=lightning`. Lightning drives
+the retire-slot half of each packet from its retirement seam
+(`retire_vector` + the DRIS entries, slot s = the entry at
+`retire_ptr + s`) — see the commit seam at the bottom of
+`rtl/ooo/LightningCore.sv`. It reports `insn` only in DEBUG builds
+(`make verify-trace TEST=... PARAMS='+define+DEBUG'`), since that is when
+the DRIS entry keeps the instruction word; nothing diffs against that
+field either way (it rides the trace inside the `#` comment the checker
+strips), so a plain build just gives a less chatty divergence report.
 
 ## Test status & caveats
 
-- LightningCore currently has **no memory unit** (D-side is tied off in
-  `riscv_core_interface.sv`) and no M extension: load/store/mul tests and
-  all C tests fail by design until those land. The harness itself is
+- No core here implements the M extension (nor does the refsim), so the 3
+  mul tests fail by design. Everything else in `tests/asm` passes on both
+  cores, `make verify` and `make verify-trace` alike. The harness itself is
   validated end-to-end against a known-good in-order core (see
   `docs/porting-log.md`, 2026-07-07).
 - `tests/c` / `tests/perf` `.reg` oracles are coupled to the class

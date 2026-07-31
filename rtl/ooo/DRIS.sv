@@ -112,10 +112,13 @@ module DRIS
                 if (writeback_pkts[i].valid_W &&
                     dris_entries[writeback_pkts[i].id_W.id_index].entry_state.valid) begin
 
-                    `ifdef DEBUG
-                        dris_entries[writeback_pkts[i].id_W.id_index].debug_pc    <= writeback_pkts[i].debug_pc_dris_W;
-                        dris_entries[writeback_pkts[i].id_W.id_index].debug_instr <= writeback_pkts[i].debug_instr_dris_W;
-                    `endif
+                    /* No debug write-back of pc/instr here: intake already
+                     * stored both (and neither field exists on the entry
+                     * under the names this used to assign — it never
+                     * compiled with DEBUG on). Copying them back from the
+                     * writeback packet would also *clear* them for loads,
+                     * whose data writeback is driven straight from the
+                     * cache response and carries no instruction word. */
 
                     if ((writeback_pkts[i].ctrl_signals_W.memRead || writeback_pkts[i].ctrl_signals_W.memWrite) &&
                     ~dris_entries[writeback_pkts[i].id_W.id_index].entry_state.mem_addr_ready) begin

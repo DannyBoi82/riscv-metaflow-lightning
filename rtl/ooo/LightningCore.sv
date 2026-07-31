@@ -55,14 +55,13 @@ module LightningCore #(
     output logic halted,
 
 `ifdef SIMULATION_18447
-    /* Commit packets for the verify-trace flow (see riscv_commit.vh).
-     * TODO(SSC): only partially populated — the SSC's reg_commits carry
-     * neither PC/insn nor non-writing retirements (branches, stores, the
-     * halting ecall), so packets fire only for register-writing
-     * retirements with pc/insn = 0. That keeps the harness's shadow
-     * regfile (and the end-state simulation.reg dump) correct, but
-     * verify-trace is unsupported on CORE=lightning until the SSC emits
-     * full per-slot retire info. */
+    /* Commit packets for the verify-trace flow (see riscv_commit.vh):
+     * one packet per instruction retired this cycle, slot 0 = oldest.
+     * Driven from the retirement seam (retire_vector + the DRIS entries)
+     * at the bottom of this file, so branches, stores and the halting
+     * ecall are reported too, not just register-writing retirements.
+     * Outside simulation the port disappears and the commit logic below
+     * is dead and gets pruned. */
     output RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0]
                  commit_pkts,
 `endif
@@ -467,14 +466,58 @@ module LightningCore #(
         end
     end : rf_write_wiring
 
-    /* Write-only commit packets: see the TODO(SSC) note on the commit_pkts
-     * port — reg_commits lack pc/insn and non-writing retirements, so
-     * packets are emitted only for register-writing retirements (pc/insn
-     * report as 0). That is enough for the harness's shadow regfile (and
-     * therefore the end-state simulation.reg dump) to track architectural
-     * state; the per-commit trace can't align with the refsim until the
-     * SSC provides the rest, so verify-trace stays inorder-only. */
+    /* =================================================================
+     * Commit packets (the verify-trace seam, rtl/include/riscv_commit.vh).
+     *
+     * The regfile assembles the packets, but it cannot source them: it
+     * only ever sees retirements that *write* a register, and it has no
+     * PC. The trace needs one packet per retired instruction — branches,
+     * stores and the halting ecall included — in program order. So the
+     * retire-slot half of each packet (valid + pc) is driven from the
+     * retirement seam here, and the regfile fills in the register-write
+     * half from the write-port inputs of the same slot (rd_addr = 0 for
+     * a non-writing retirement or a write to x0, per the RVFI contract).
+     *
+     * Program order within a cycle: the SSC publishes retire_vector
+     * entry-indexed (it scattered its slot window onto entry indices),
+     * so slot order is recovered the way the SSC built it — slot s is
+     * the entry at retire_ptr + s, slot 0 being the oldest. That is also
+     * the slot that reg_commits[s] / regfile write port s belongs to, so
+     * the two halves of the packet stay aligned by construction.
+     *
+     * The instruction word is reported only in `DEBUG builds
+     * (`PARAMS='+define+DEBUG'`), which is when the DRIS entry carries
+     * one. Nothing diffs against it — insn rides the trace inside the
+     * `#` comment the checker strips — it only annotates the divergence
+     * report, where pc identifies the instruction anyway.
+     * ================================================================= */
+`ifndef SIMULATION_18447
+    // Off-simulation stand-in for the ifdef'd port, so the commit logic
+    // below always elaborates (it is dead there and gets pruned).
+    RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0] commit_pkts;
+`endif
+
     RISCV_Commit::commit_pkt_t [RF_WAYS-1:0] rf_commit_pkts;
+    logic [RF_WAYS-1:0]           rf_commit_valid;
+    logic [RF_WAYS-1:0][XLEN-1:0] rf_commit_pc, rf_commit_insn;
+
+    // DRIS index of the n-th retirement slot, counting from the retire
+    // pointer — the same mapping the SSC scatters retire_vector through.
+    function automatic logic [DRIS_ID_WIDTH-1:0] retire_slot_index(input int slot);
+        return (retire_ptr + slot) % DRIS_NUM_ENTRIES;
+    endfunction
+
+    always_comb begin : commit_seam
+        for (int s = 0; s < RF_WAYS; s++) begin
+            rf_commit_valid[s] = retire_vector[retire_slot_index(s)];
+            rf_commit_pc[s]    = dris_entries[retire_slot_index(s)].pc;
+`ifdef DEBUG
+            rf_commit_insn[s]  = dris_entries[retire_slot_index(s)].debug_instr;
+`else
+            rf_commit_insn[s]  = '0;
+`endif
+        end
+    end : commit_seam
 
     register_file #(
         .WAYS (RF_WAYS)
@@ -486,20 +529,35 @@ module LightningCore #(
         .rs2          (rf_rs2),
         .rd           (rf_rd),
         .rd_data      (rf_rd_data),
-        .commit_valid (rf_we),
-        .commit_pc    ('0),
-        .commit_insn  ('0),
+        .commit_valid (rf_commit_valid),
+        .commit_pc    (rf_commit_pc),
+        .commit_insn  (rf_commit_insn),
         .rs1_data     (rf_rs1_data),
         .rs2_data     (rf_rs2_data),
         .commit_pkts  (rf_commit_pkts)
     );
 
-`ifdef SIMULATION_18447
     always_comb begin : commit_pkt_padding
         commit_pkts = '0;
         for (int i = 0; i < RF_WAYS; i++)
             commit_pkts[i] = rf_commit_pkts[i];
-    end : commit_pkt_padding
+
+        /* The halting ecall never retires — the SSC traps on it at the
+         * retire head instead, which is what raises `halted` — so no
+         * retire slot reports it. The reference simulator does execute
+         * it and emits a final trace line, so force one last packet on
+         * the halt edge (the in-order core does the same through
+         * `valid_W & (~stall_W | halted)`). It writes no register, and
+         * slot 0 is free: nothing retires in a cycle whose head entry
+         * has trapped. */
+        if (halted) begin
+            commit_pkts[0]          = '0;
+            commit_pkts[0].valid    = 1'b1;
+            commit_pkts[0].pc_rdata = trap_pc;
+`ifdef DEBUG
+            commit_pkts[0].insn     = dris_entries[trap_id.id_index].debug_instr;
 `endif
+        end
+    end : commit_pkt_padding
 
 endmodule : LightningCore

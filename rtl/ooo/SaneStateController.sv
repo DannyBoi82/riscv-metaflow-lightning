@@ -120,7 +120,7 @@ module SaneStateController #(
                         // populate reg_commits based on the entry's information
 
                         `ifdef DEBUG
-                            reg_commits[reg_commit_genvar].debug_instr_regfile_C = entries_checked[reg_commit_genvar].instr;
+                            reg_commits[reg_commit_genvar].debug_instr_regfile_C = entries_checked[reg_commit_genvar].debug_instr;
                             reg_commits[reg_commit_genvar].debug_pc_regfile_C = entries_checked[reg_commit_genvar].pc;
                         `endif
                         reg_commits[reg_commit_genvar].valid_C = 1'b1;

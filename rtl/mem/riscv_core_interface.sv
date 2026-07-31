@@ -24,8 +24,9 @@ module riscv_core_interface (
      output logic                 mem_data_stall,
      output logic [31:0]          mem_data_store
 `ifdef SIMULATION_18447
-     // Commit packets for the verify-trace flow (riscv_commit.vh); all
-     // slots invalid until the SSC emits retire info (see LightningCore).
+     // Commit packets for the verify-trace flow (riscv_commit.vh), driven
+     // from the core's retirement seam (see LightningCore). RF_WAYS = 7 of
+     // the COMMIT_WAYS_MAX slots are used; the rest stay invalid.
      ,
      output RISCV_Commit::commit_pkt_t [RISCV_Commit::COMMIT_WAYS_MAX-1:0]
                                    commit_pkts
