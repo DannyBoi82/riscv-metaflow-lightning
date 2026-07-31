@@ -11,7 +11,7 @@ module SaneStateController #(
     parameter int REG_RETIRES_PER_CYCLE = DRIS_defs::REG_FILE_WRITE_PORTS,
     parameter int MEMORY_RETIRES_PER_CYCLE = DRIS_defs::MEMORY_WRITE_PORTS,
 
-    localparam int RETIRES_PER_CYCLE = REG_RETIRES_PER_CYCLE + MEMORY_RETIRES_PER_CYCLE
+    localparam int RETIRES_PER_CYCLE = REG_RETIRES_PER_CYCLE
     )(
     input  logic clock, reset_n,
 
