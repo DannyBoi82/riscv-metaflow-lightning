@@ -3,6 +3,7 @@
 `include "riscv_uarch.vh"
 `include "config.vh"                   // Centralized hardware configuration
 
+`define DEBUG
 
 //stages:
 // fetch = F
@@ -12,6 +13,13 @@
 // dris writeback = W
 // commit = C
 
+/* NOTE: the `ifdef DEBUG fields below are the compile-wide switch for the
+ * whole OoO pipeline, and this file is compiled *first* (the `1` prefix
+ * orders packages ahead of the modules). Set DEBUG on the command line —
+ * `make ... PARAMS='+define+DEBUG'`, or PARAMS in config.mk to make it
+ * stick. A `define DEBUG in a module source is too late: the structs are
+ * already built without these members, while every file compiled after it
+ * still references them, and you get a wall of "member not found". */
 package DRIS_defs;
 
     import RISCV_ISA::XLEN, RISCV_ISA::REG_NUM_WIDTH;
