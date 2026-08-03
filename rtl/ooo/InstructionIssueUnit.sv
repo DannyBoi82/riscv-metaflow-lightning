@@ -249,7 +249,7 @@ module InstructionIssueUnit #(
         for (int w = 0; w < FETCH_WORDS; w++) begin
             slot_valid[w]   = core_rsp_data_valid && !cut && (w < avail);
             slot_pred_pc[w] = slot_pc[w] + XLEN'(4);
-            if (slot_valid[w] && slot_is_ct[w]) begin
+            if (slot_valid[w] && slot_is_ct[w] && ct_count < shelf_free_count) begin
                 if (slot_ctrl[w].pc_source == PC_uncond) begin
                     // JAL: exact target; fetch ran past it, so always cut
                     slot_pred_pc[w]  = slot_pc[w] + slot_imm[w];
@@ -280,6 +280,12 @@ module InstructionIssueUnit #(
                     ct_count    += 1'b1;
                 end
             end
+
+            //commented because it doesnt work (beq test hangs)
+            // if (ct_count > shelf_free_count) begin
+            //     // Stall the intake if the shelf can't hold all the CTs
+            //     cut              = 1'b1;
+            // end
         end
     end : group_formation
 
