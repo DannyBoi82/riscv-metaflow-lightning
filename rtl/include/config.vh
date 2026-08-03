@@ -95,7 +95,7 @@
 
 // Unresolved speculative branches the branch shelf can hold
 `ifndef LTG_BRANCH_SHELF_ENTRIES
-`define LTG_BRANCH_SHELF_ENTRIES 2
+`define LTG_BRANCH_SHELF_ENTRIES 4
 `endif
 
 // DRIS entries the scheduler checks for readiness each cycle

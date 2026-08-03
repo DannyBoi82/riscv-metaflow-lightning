@@ -6,3 +6,5 @@ in order of discovery
 4. fun fact: the byte offset of a load comes from the bottom 2 bits of its FULL address (32 bits), not the bottom 2 bits of its MEMORY address (30 bits)
 5a. memtest1 and memtest2 look very similar in vscode's tabs. make sure you are looking at the right testcase idiot
 5b. ssc needs to index into dris with DRIS_ENTRIES-1 bits to not include the color bit and walk off the end of the dris array.
+6. ssc RETIRES_PER_CYCLE cant be > than #of reg file write ports (killed memtest2 because that was the first time the ssc slots were filled that much)
+7. the number of control flow instructions/ fetch group needs to be <= the size of the branch shelf. crazy.

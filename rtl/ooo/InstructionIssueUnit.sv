@@ -205,7 +205,17 @@ module InstructionIssueUnit #(
      *   - younger branch: static not-taken (pc + 4), group continues
      *   - younger JALR: cut the group *before* it; pc+4 would be a
      *     guaranteed mispredict, so refetch it as oldest of next group
+     *
+     * A group also never carries more CTs than the branch shelf can hold
+     * (CT_PER_GROUP_MAX); the intake stall below waits for *free* shelf
+     * entries, and it can only ever be satisfied if the demand fits the
+     * shelf's capacity in the first place.
      * ================================================================= */
+    // Shelf capacity, clamped to the group width (a group can't hold more
+    // CTs than it has slots).
+    localparam int CT_PER_GROUP_MAX =
+        (DRIS_defs::BRANCH_SHELF_ENTRIES < FETCH_WORDS)
+            ? DRIS_defs::BRANCH_SHELF_ENTRIES : FETCH_WORDS;
     logic [FETCH_WORDS-1:0] slot_valid;
     logic [FETCH_WORDS-1:0] slot_is_ct;
     logic [XLEN-1:0]        slot_pc      [FETCH_WORDS-1:0];
@@ -249,8 +259,21 @@ module InstructionIssueUnit #(
         for (int w = 0; w < FETCH_WORDS; w++) begin
             slot_valid[w]   = core_rsp_data_valid && !cut && (w < avail);
             slot_pred_pc[w] = slot_pc[w] + XLEN'(4);
-            if (slot_valid[w] && slot_is_ct[w] && ct_count < shelf_free_count) begin
-                if (slot_ctrl[w].pc_source == PC_uncond) begin
+            if (slot_valid[w] && slot_is_ct[w]) begin
+                if (int'(ct_count) >= CT_PER_GROUP_MAX) begin
+                    // Shelf capacity reached: end the group before this CT
+                    // and refetch it as the oldest CT of the next group
+                    // (same treatment as a younger JALR). Bounding the
+                    // group by the shelf's *capacity* is what keeps the
+                    // shelf_room stall satisfiable — a group demanding more
+                    // entries than the shelf can ever hold would stall for
+                    // ever. CT_PER_GROUP_MAX >= 1, so at least the oldest
+                    // CT is always taken and the group is never empty.
+                    slot_valid[w]    = 1'b0;
+                    cut              = 1'b1;
+                    ct_redirect_pend = 1'b1;
+                    ct_resume_pc     = slot_pc[w];
+                end else if (slot_ctrl[w].pc_source == PC_uncond) begin
                     // JAL: exact target; fetch ran past it, so always cut
                     slot_pred_pc[w]  = slot_pc[w] + slot_imm[w];
                     group_has_ct     = 1'b1;
@@ -280,12 +303,6 @@ module InstructionIssueUnit #(
                     ct_count    += 1'b1;
                 end
             end
-
-            //commented because it doesnt work (beq test hangs)
-            // if (ct_count > shelf_free_count) begin
-            //     // Stall the intake if the shelf can't hold all the CTs
-            //     cut              = 1'b1;
-            // end
         end
     end : group_formation
 
