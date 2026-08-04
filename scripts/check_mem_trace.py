@@ -13,7 +13,8 @@ files hold one line per load/store, in program order:
 `mask` is the byte enables within the containing word (size + lane) and `data`
 holds the transferred bytes *in their word lanes*, so both fields describe the
 memory bus rather than the register file. '#' comments (the RTL side carries
-' #cycle=N insn=X') are ignored for comparison and read back for the report.
+' #cycle=N time=T insn=X') are ignored for comparison and read back for the
+report.
 
 Where check_commit_trace.py stops at the first divergent commit — full
 architectural state per line means one mismatch cannot slip the alignment —
@@ -92,14 +93,20 @@ def parse_trace(path):
 
 
 def comment_info(comment):
-    """Formats the RTL-side ' #cycle=N insn=X' metadata, if present."""
+    """Formats the RTL-side ' #cycle=N time=T insn=X' metadata. Every field is
+    optional: the refsim side carries no comment at all, and traces written
+    before `time=` existed still report their cycle."""
     cycle = re.search(r"cycle=(\d+)", comment)
+    time = re.search(r"time=(\d+)", comment)
     insn = re.search(r"insn=([0-9a-fA-F]+)", comment)
     parts = []
     if insn:
         parts.append(f"insn 0x{insn.group(1)}")
     if cycle:
-        parts.append(f"committed at RTL cycle {cycle.group(1)}")
+        parts.append(f"committed at RTL cycle {cycle.group(1)}"
+                     + (f" (time {time.group(1)})" if time else ""))
+    elif time:
+        parts.append(f"committed at time {time.group(1)}")
     return ", ".join(parts)
 
 

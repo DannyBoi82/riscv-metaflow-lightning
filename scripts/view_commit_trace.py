@@ -9,7 +9,7 @@ prints as one row showing the PC and the registers that *changed* at that
 commit; --full instead dumps the complete 32-register state per commit
 (only sensible for short tests).
 
-Works on both the RTL trace (commit_trace.txt; cycle/insn read from its
+Works on both the RTL trace (commit_trace.txt; cycle/time/insn read from its
 comments) and refsim statetrace files.
 """
 
@@ -50,8 +50,10 @@ def main():
                      f"fields, got {len(fields)}.")
 
         cycle = re.search(r"cycle=(\d+)", comment)
+        time = re.search(r"time=(\d+)", comment)
         insn = re.search(r"insn=([0-9a-fA-F]+)", comment)
         meta = (f" cycle={cycle.group(1)}" if cycle else "") + \
+               (f" time={time.group(1)}" if time else "") + \
                (f" insn={insn.group(1)}" if insn else "")
 
         header = ("anchor  " if k == 0 else f"#{k:<7}") \

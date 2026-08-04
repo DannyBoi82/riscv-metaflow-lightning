@@ -13,7 +13,7 @@
  * Duties:
  *  - With the `+commit_trace` plusarg: print one compact full-state line
  *    per committed instruction to commit_trace.txt — the retiring PC plus
- *    x1..x31 in hex, with a ` #cycle=N` comment the checker strips. An
+ *    x1..x31 in hex, with a ` #cycle=N time=T` comment the checker strips. An
  *    initial anchor line (reset state, PC = USER_TEXT_START) is printed
  *    so a reset-state mismatch is caught at commit 0.
  *  - With the `+mem_trace` plusarg: print one line per *committed memory op*
@@ -176,11 +176,17 @@ module commit_verifier
 
     /* Prints one compact commit-trace line: the PC of the retiring
      * instruction, then x1..x31 (x0 elided), all as bare 8-digit hex, then
-     * a '#' comment carrying the RTL retire cycle and instruction word (the
-     * trace checker strips '#' comments before diffing — the refsim side
-     * has neither, and the checker reads them back for its divergence
-     * report). One line per commit is the only diffed format;
-     * pretty-printing is a viewer script over these lines. */
+     * a '#' comment carrying the RTL retire cycle, the simulation time and
+     * the instruction word (the trace checker strips '#' comments before
+     * diffing — the refsim side has none of them, and the checker reads
+     * them back for its divergence report). One line per commit is the only
+     * diffed format; pretty-printing is a viewer script over these lines.
+     *
+     * `cycle` is passed in because top.cycle_count needs a hierarchical
+     * reference from the caller; $time does not, and is the same simulation
+     * time as the commit being printed. It is what a waveform viewer is
+     * indexed by, so the divergence report can be acted on directly rather
+     * than converting cycles by hand at the current LTG_CLOCK_HALF_PERIOD. */
     function automatic void print_state_line(int fd, logic [XLEN-1:0] pc,
             const ref logic [NUM_REGS-1:0][XLEN-1:0] regs, input int cycle,
             input logic [XLEN-1:0] insn);
@@ -189,14 +195,14 @@ module commit_verifier
         for (int i = 1; i < NUM_REGS; i++) begin
             $fwrite(fd, " %x", regs[i]);
         end
-        $fwrite(fd, " #cycle=%0d insn=%x\n", cycle, insn);
+        $fwrite(fd, " #cycle=%0d time=%0d insn=%x\n", cycle, $time, insn);
     endfunction: print_state_line
 
     /* Prints one memory-op trace line for a committed instruction that touched
      * memory, and nothing at all for one that did not:
      *
-     *     <pc> <L|S> <addr> <mask> <data>   #cycle=N insn=X
-     *     004000a4 S 10000000 f 0000002a    #cycle=41 insn=00a12023
+     *     <pc> <L|S> <addr> <mask> <data>   #cycle=N time=T insn=X
+     *     004000a4 S 10000000 f 0000002a    #cycle=41 time=4100 insn=00a12023
      *
      * This is the RTL half of verify-mem; the reference simulator's `memtrace`
      * command writes the same five fields (see scripts/check_mem_trace.py,
@@ -221,11 +227,12 @@ module commit_verifier
         end
 
         is_load = (pkt.mem.rmask != 4'd0);
-        $fwrite(fd, "%x %s %x %x %x #cycle=%0d insn=%x\n", pkt.pc_rdata,
+        $fwrite(fd, "%x %s %x %x %x #cycle=%0d time=%0d insn=%x\n",
+                pkt.pc_rdata,
                 is_load ? "L" : "S", pkt.mem.addr,
                 is_load ? pkt.mem.rmask : pkt.mem.wmask,
                 is_load ? pkt.mem.rdata : pkt.mem.wdata,
-                cycle, pkt.insn);
+                cycle, $time, pkt.insn);
     endfunction: print_mem_line
 
     // Dumps the end-of-run register state to stdout and the .reg files
@@ -234,8 +241,11 @@ module commit_verifier
 
         int fd;
 
-        $display("\n18-447 Register File Dump at Cycle %0d, Mem Accesses: %0d",
-                $time, top.mem_access);
+        /* Cycle and time are both printed, and are *not* interchangeable:
+         * this line used to pass $time under the "Cycle" label, which made a
+         * watchdog kill look like it ran 2e9 cycles against a 20M limit. */
+        $display("\n18-447 Register File Dump at Cycle %0d (time %0d), Mem Accesses: %0d",
+                top.cycle_count, $time, top.mem_access);
         $display("---------------------------------------------\n");
         print_cpu_state(STDOUT, registers);
 
@@ -245,8 +255,8 @@ module commit_verifier
         $fclose(fd);
 
         fd = $fopen("simulation.reg2");
-        $fdisplay(fd, "\n18-447 Register File Dump at Cycle %0d, Mem Accesses: %0d",
-                $time, top.mem_access);
+        $fdisplay(fd, "\n18-447 Register File Dump at Cycle %0d (time %0d), Mem Accesses: %0d",
+                top.cycle_count, $time, top.mem_access);
         $fdisplay(fd, "---------------------------------------------\n");
         print_cpu_state(fd, registers);
         $fclose(fd);

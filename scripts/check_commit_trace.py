@@ -7,8 +7,8 @@ written by tb/commit_verifier.sv when simulating with +commit_trace) against
 the reference simulator's state trace (written by the refsim 'statetrace'
 command). Both files hold one line per committed instruction — the retiring
 PC then x1..x31 in hex — plus an initial anchor line (state before the first
-commit). '#' comments (the RTL side carries ' #cycle=N insn=X') are ignored
-for comparison and read back for the divergence report.
+commit). '#' comments (the RTL side carries ' #cycle=N time=T insn=X') are
+ignored for comparison and read back for the divergence report.
 
 Because each line is a *full* architectural state keyed by "one committed
 instruction", the diff self-anchors: the first divergent line is the exact
@@ -61,14 +61,20 @@ def parse_trace(path):
 
 
 def comment_info(comment):
-    """Formats the RTL-side ' #cycle=N insn=X' metadata, if present."""
+    """Formats the RTL-side ' #cycle=N time=T insn=X' metadata. Every field is
+    optional: the refsim side carries no comment at all, and traces written
+    before `time=` existed still report their cycle."""
     cycle = re.search(r"cycle=(\d+)", comment)
+    time = re.search(r"time=(\d+)", comment)
     insn = re.search(r"insn=([0-9a-fA-F]+)", comment)
     parts = []
     if insn:
         parts.append(f"insn 0x{insn.group(1)}")
     if cycle:
-        parts.append(f"retired at RTL cycle {cycle.group(1)}")
+        parts.append(f"retired at RTL cycle {cycle.group(1)}"
+                     + (f" (time {time.group(1)})" if time else ""))
+    elif time:
+        parts.append(f"retired at time {time.group(1)}")
     return ", ".join(parts)
 
 
@@ -106,9 +112,10 @@ def main():
             prev_info = comment_info(rtl_comments[k - 1])
             print(f"  previous commit (#{k - 1}) matched: pc {rtl[k - 1][0]}"
                   + (f"  [{prev_info}]" if prev_info else ""))
-        print("\nNote: the RTL retire cycle is an upper bound — the wrong "
-              "value was computed at\nissue/execute, earlier. "
-              "`make waves TEST=...` and work backwards from there.")
+        print("\nNote: the RTL retire cycle/time is an upper bound — the "
+              "wrong value was computed at\nissue/execute, earlier. "
+              "`make waves TEST=...`, jump to the time above, and work\n"
+              "backwards from there.")
         return 1
 
     # Same prefix; complain if one side has more commits than the other

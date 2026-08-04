@@ -1,0 +1,59 @@
+Comparing the RTL memory trace against the reference...
+Memory traces DIVERGE.
+
+WRONG ADDRESS
+    ref output/vcs/refmemtrace.txt:88: store pc=0040004c addr=10000008 mask=f data=04d80991
+    rtl output/vcs/mem_trace.txt:88: store pc=0040004c addr=00000000 mask=f data=04d80991  [insn 0x00d7a023, committed at RTL cycle 907]
+      address: ref=10000008  rtl=00000000
+
+WRONG DATA
+    ref output/vcs/refmemtrace.txt:90: load  pc=00400040 addr=10000008 mask=f data=04d80991
+    rtl output/vcs/mem_trace.txt:90: load  pc=00400040 addr=10000008 mask=f data=04c88b1e  [insn 0xffc7a683, committed at RTL cycle 925]
+      data: ref=04d80991  rtl=04c88b1e
+
+WRONG ADDRESS
+    ref output/vcs/refmemtrace.txt:94: store pc=0040004c addr=10000010 mask=f data=458f0b37
+    rtl output/vcs/mem_trace.txt:94: store pc=0040004c addr=00000000 mask=f data=458f0b37  [insn 0x00d7a023, committed at RTL cycle 945]
+      address: ref=10000010  rtl=00000000
+
+WRONG DATA
+    ref output/vcs/refmemtrace.txt:96: load  pc=00400040 addr=10000010 mask=f data=458f0b37
+    rtl output/vcs/mem_trace.txt:96: load  pc=00400040 addr=10000010 mask=f data=859babf3  [insn 0xffc7a683, committed at RTL cycle 955]
+      data: ref=458f0b37  rtl=859babf3
+
+MISSING (2 op(s)): the RTL never committed these
+    ref output/vcs/refmemtrace.txt:98: store pc=0040004c addr=10000014 mask=f data=458f0b37
+    ref output/vcs/refmemtrace.txt:99: store pc=00400050 addr=10000010 mask=f data=d5f9cbd8
+
+WRONG DATA
+    ref output/vcs/refmemtrace.txt:100: load  pc=00400040 addr=10000014 mask=f data=458f0b37
+    rtl output/vcs/mem_trace.txt:98: load  pc=00400040 addr=10000014 mask=f data=d5f9cbd8  [insn 0xffc7a683, committed at RTL cycle 970]
+      data: ref=458f0b37  rtl=d5f9cbd8
+
+MISSING (2 op(s)): the RTL never committed these
+    ref output/vcs/refmemtrace.txt:102: store pc=0040004c addr=10000018 mask=f data=458f0b37
+    ref output/vcs/refmemtrace.txt:103: store pc=00400050 addr=10000014 mask=f data=e5ec620a
+
+WRONG DATA
+    ref output/vcs/refmemtrace.txt:104: load  pc=00400040 addr=10000018 mask=f data=458f0b37
+    rtl output/vcs/mem_trace.txt:100: load  pc=00400040 addr=10000018 mask=f data=e5ec620a  [insn 0xffc7a683, committed at RTL cycle 985]
+      data: ref=458f0b37  rtl=e5ec620a
+
+MISSING (2 op(s)): the RTL never committed these
+    ref output/vcs/refmemtrace.txt:106: store pc=0040004c addr=1000001c mask=f data=458f0b37
+    ref output/vcs/refmemtrace.txt:107: store pc=00400050 addr=10000018 mask=f data=31057a21
+
+WRONG DATA
+    ref output/vcs/refmemtrace.txt:108: load  pc=00400040 addr=1000001c mask=f data=458f0b37
+    rtl output/vcs/mem_trace.txt:102: load  pc=00400040 addr=1000001c mask=f data=31057a21  [insn 0xffc7a683, committed at RTL cycle 992]
+      data: ref=458f0b37  rtl=31057a21
+
+... and 2699 more divergence(s) (raise --max-blocks to see them).
+
+Summary: 2709 divergence(s) (extra, missing, wrong-value), 542 op(s) matched.
+  ref output/vcs/refmemtrace.txt: 9360 ops (6347 L / 3013 S)
+  rtl output/vcs/mem_trace.txt: 7206 ops (6097 L / 1109 S)
+
+Note: ops are listed in commit (program) order, so the RTL cycle is an upper bound —
+the address was computed, and the access issued, earlier. `make waves TEST=...`
+and work backwards from the first block above.

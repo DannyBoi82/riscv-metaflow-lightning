@@ -296,7 +296,9 @@ only at retirement.
   architectural regfile (packets applied slot-serialized through a
   blocking temp so halt-edge commits are dump-visible), one full-state
   line per commit to `commit_trace.txt` under the `+commit_trace`
-  plusarg (line = pc + x1..x31 hex + `#cycle=N insn=X` comment), initial
+  plusarg (line = pc + x1..x31 hex + `#cycle=N time=T insn=X` comment,
+  `time` being `$time` so a divergence maps straight onto a waveform),
+  initial
   anchor line, and the end-of-run `simulation.reg`/`simulation.reg2`/
   stdout dump — **the dump comes from the shadow**, so `make verify`
   depends on faithful commit packets (shadow-vs-flops cross-check is a

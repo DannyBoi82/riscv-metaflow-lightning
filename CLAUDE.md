@@ -11,7 +11,8 @@ structure changes.
 
 - `make verify TEST=tests/asm/additest.S` — build, run, diff vs `.reg` oracle
 - `make verify-trace TEST=...` — per-commit architectural state compare vs
-  refsim; first divergent commit reported with pc/insn/regs/cycle (README
+  refsim; first divergent commit reported with pc/insn/regs/cycle and the
+  `$time` to jump to in the waveform (README
   "verify-trace"). Works on both cores; on lightning the `insn` annotation
   needs `PARAMS='+define+DEBUG'` (the DRIS keeps the instruction word only
   in DEBUG builds) — nothing diffs against that field either way

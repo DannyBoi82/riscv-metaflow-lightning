@@ -63,7 +63,8 @@ automatically when PARAMS change. Build knobs live in `config.mk`.
 `make verify-trace TEST=...` compares **full architectural
 register state after every committed instruction** against the reference
 simulator, and reports the first divergent commit with its PC, instruction,
-differing registers, and RTL retire cycle (jump there with `make waves`).
+differing registers, and RTL retire cycle plus the `$time` it retired at —
+open `make waves` and jump straight to that time.
 Because every line is a full state keyed by "one committed instruction",
 the diff self-anchors — bubbles, stalls, and multi-way retirement can't
 slip the alignment the way the old write-event trace could.
