@@ -41,6 +41,8 @@ typedef struct cpu_state {
     FILE *trace_fd;                     // Trace file descriptor
     bool statetrace_mode;               // Indicates if state-trace mode is active
     FILE *statetrace_fd;                // State-trace file descriptor
+    bool memtrace_mode;                 // Indicates if memory-op tracing is active
+    FILE *memtrace_fd;                  // Memory-op trace file descriptor
     bool halted;                        // Indicates if the CPU is halted
     int cycle;                          // Number of processor cycles
     uint32_t pc;                        // Current program counter
@@ -71,5 +73,28 @@ typedef struct cpu_state {
  *                  instruction to simulate it.
  **/
 void process_instruction(cpu_state_t *cpu_state);
+
+/**
+ * Records one committed memory operation to the memory-op trace.
+ *
+ * This is the reference half of the verify-mem flow (see the 'memtrace' shell
+ * command and scripts/check_mem_trace.py): one line per load/store the program
+ * architecturally performs, which the RTL's committed memory ops are diffed
+ * against. It is a no-op unless memtrace mode is active, so the load/store
+ * cases in process_instruction() can call it unconditionally.
+ *
+ * Inputs:
+ *  - cpu_state     The state of the CPU being simulated.
+ *  - pc            PC of the load/store instruction (*before* it is advanced).
+ *  - is_store      True for a store, false for a load.
+ *  - addr          Byte address of the access, unaligned low bits included.
+ *  - mask          Byte enables of the access within its containing word,
+ *                  i.e. size and lane: 0xf/0x3/0xc/0x1/0x2/0x4/0x8.
+ *  - data          The bytes transferred, positioned in their word lanes
+ *                  (bytes outside `mask` must be zero). No sign extension:
+ *                  this is the value on the memory bus, not in the register.
+ **/
+void memtrace_record(cpu_state_t *cpu_state, uint32_t pc, bool is_store,
+        uint32_t addr, uint32_t mask, uint32_t data);
 
 #endif /* SIM_H_ */

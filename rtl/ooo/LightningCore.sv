@@ -500,6 +500,7 @@ module LightningCore #(
     RISCV_Commit::commit_pkt_t [RF_WAYS-1:0] rf_commit_pkts;
     logic [RF_WAYS-1:0]           rf_commit_valid;
     logic [RF_WAYS-1:0][XLEN-1:0] rf_commit_pc, rf_commit_insn;
+    RISCV_Commit::commit_mem_t [RF_WAYS-1:0] rf_commit_mem;
 
     // DRIS index of the n-th retirement slot, counting from the retire
     // pointer — the same mapping the SSC scatters retire_vector through.
@@ -519,6 +520,81 @@ module LightningCore #(
         end
     end : commit_seam
 
+    /* =================================================================
+     * The memory half of the commit packet (verify-mem, riscv_commit.vh).
+     *
+     * Loads report from the retiring entry: the address is the copy the
+     * AGU pass parked in `debug_mem_addr` (result_data has since been
+     * clobbered by the load's own data writeback) and the data is the
+     * load result, un-extended back into its word lanes so both sides of
+     * the diff describe the bus rather than the register.
+     *
+     * Stores can't report from the entry: the store data never enters the
+     * DRIS (the MemoryScheduler reads rs2 at issue) and the mask is built
+     * there too. They don't have to — a store issues to the cache in the
+     * *same* cycle it retires, by construction (SaneStateController gates
+     * a store's retirement on `store_ready & d_cache_ready`), so the live
+     * request is still on the wire and can be matched to the retiring
+     * entry by DRIS id. That also makes the trace report the actual bus
+     * values, so a lane bug in get_store_mask/get_store_data shows up
+     * here instead of being re-derived away.
+     * ================================================================= */
+`ifdef DEBUG
+    logic [DRIS_ID_WIDTH-1:0] commit_mem_entry;
+    logic [XLEN-1:0]          commit_mem_addr;
+    logic [3:0]               commit_size_mask;
+`endif
+
+    always_comb begin : commit_mem_seam
+        rf_commit_mem = '0;
+`ifdef DEBUG
+        commit_mem_entry = '0;
+        commit_mem_addr  = '0;
+        commit_size_mask = '0;
+        for (int s = 0; s < RF_WAYS; s++) begin
+            commit_mem_entry = retire_slot_index(s);
+            commit_mem_addr  = dris_entries[commit_mem_entry].debug_mem_addr;
+            commit_size_mask = get_byte_mask(commit_mem_addr,
+                    dris_entries[commit_mem_entry].ctrl_signals.ldst_mode);
+
+            if (rf_commit_valid[s] &&
+                dris_entries[commit_mem_entry].ctrl_signals.memRead) begin
+
+                rf_commit_mem[s].addr  = commit_mem_addr;
+                rf_commit_mem[s].rmask = commit_size_mask;
+                /* result_data is the sign/zero-extended load value; shift the
+                 * accessed bytes back to their lanes. */
+                rf_commit_mem[s].rdata =
+                        (dris_entries[commit_mem_entry].result.result_data
+                         & expand_byte_mask(commit_size_mask >> commit_mem_addr[1:0]))
+                        << (8 * commit_mem_addr[1:0]);
+            end
+            else if (rf_commit_valid[s] &&
+                     dris_entries[commit_mem_entry].ctrl_signals.memWrite) begin
+
+                rf_commit_mem[s].addr = commit_mem_addr;
+                for (int w = 0; w < MEM_ISSUE_WAYS; w++) begin
+                    if (mem_issue_pkts[w].core_req_we &&
+                        (mem_issue_pkts[w].core_req_id.id_index == commit_mem_entry)) begin
+                        /* Address off the bus, not the entry: the point is to
+                         * report what the cache was actually asked for. (They
+                         * agree today — the MemoryScheduler drives
+                         * result_data[31:2], the same value the AGU pass
+                         * parked — which is exactly what makes it worth
+                         * reporting the one the hardware used.) */
+                        rf_commit_mem[s].addr  =
+                                {mem_issue_pkts[w].core_req_addr, commit_mem_addr[1:0]};
+                        rf_commit_mem[s].wmask = mem_issue_pkts[w].core_req_store_mask;
+                        rf_commit_mem[s].wdata =
+                                mem_issue_pkts[w].core_req_store_data
+                                & expand_byte_mask(mem_issue_pkts[w].core_req_store_mask);
+                    end
+                end
+            end
+        end
+`endif
+    end : commit_mem_seam
+
     register_file #(
         .WAYS (RF_WAYS)
     ) rf (
@@ -532,6 +608,7 @@ module LightningCore #(
         .commit_valid (rf_commit_valid),
         .commit_pc    (rf_commit_pc),
         .commit_insn  (rf_commit_insn),
+        .commit_mem   (rf_commit_mem),
         .rs1_data     (rf_rs1_data),
         .rs2_data     (rf_rs2_data),
         .commit_pkts  (rf_commit_pkts)

@@ -96,8 +96,13 @@ package DRIS_defs;
 
         `ifdef DEBUG
             logic [XLEN-1:0] debug_instr;
+            /* The load/store address, parked here by the AGU pass and never
+             * overwritten. `result.result_data` holds it too, but a load's
+             * data writeback clobbers that, and the verify-mem commit seam
+             * (LightningCore) needs the address at *retirement*. */
+            logic [XLEN-1:0] debug_mem_addr;
         `endif
-        
+
         //not in the patent, but the metaflow paper 
         //says that the PC is in there
         logic [XLEN-1:0] pc;
@@ -188,6 +193,30 @@ package DRIS_defs;
         logic [REG_NUM_WIDTH-1:0]    rs2_C;           // source register for store data, ignored for loads
         dris_id_t                    id_C;            // so the DRIS knows which entry to free
     } memory_commit_pkt_t;
+
+`ifdef DEBUG
+    /* Byte enables of a load/store within its containing word, from the access
+     * size and the address's byte offset. Used by the verify-mem commit seam
+     * in LightningCore to report a load's read mask; the store side reports
+     * the mask the MemoryScheduler actually put on the bus instead, so a bug
+     * in `MemoryScheduler.get_store_mask()` (which computes the same thing,
+     * and must agree with this) still shows up in the trace. */
+    function automatic logic [3:0] get_byte_mask(logic [XLEN-1:0] addr,
+                                                 ldst_mode_t ldst_mode);
+        case (ldst_mode)
+            LDST_B, LDST_BU:  return 4'b0001 << addr[1:0];
+            LDST_H, LDST_HU:  return addr[1] ? 4'b1100 : 4'b0011;
+            LDST_W:           return 4'b1111;
+            default:          return 4'b0000;
+        endcase
+    endfunction
+
+    // Byte enables -> bit mask, for zeroing the lanes an access didn't touch.
+    function automatic logic [XLEN-1:0] expand_byte_mask(logic [3:0] byte_mask);
+        return {{8{byte_mask[3]}}, {8{byte_mask[2]}},
+                {8{byte_mask[1]}}, {8{byte_mask[0]}}};
+    endfunction
+`endif
 
      // returns true if a is older than b
     function automatic logic is_older(dris_id_t a, dris_id_t b);

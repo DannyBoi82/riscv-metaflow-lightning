@@ -151,6 +151,16 @@ void command_trace(cpu_state_t *cpu_state, char *args[], int num_args);
 void command_statetrace(cpu_state_t *cpu_state, char *args[], int num_args);
 
 /**
+ * Toggles memory-operation tracing mode for the simulator.
+ *
+ * While active, one line is written per load/store the program performs (pc,
+ * L|S, address, byte mask, lane-aligned data) to the file given as the
+ * optional argument (default "memtrace.txt"). There is no anchor line. This is
+ * the verify-mem format that RTL memory traces are diffed against.
+ **/
+void command_memtrace(cpu_state_t *cpu_state, char *args[], int num_args);
+
+/**
  * Quits the simulator.
  **/
 bool command_quit(cpu_state_t *cpu_state, char *args[], int num_args);

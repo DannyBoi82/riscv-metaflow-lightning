@@ -448,7 +448,12 @@ module cache_controller2 #(
     // uses: peek_only holds the head entry while the core is stalled
     // (core_req_stall_mem), so a 1-cycle hit/fill pulse is never lost, and
     // flush drops in-flight responses on a redirect.
+    // Depth 2 = one head held under peek_only + one in-flight probe's response.
+    // The core's backpressure (see the overflow assert below) is what keeps
+    // the outstanding work inside that bound.
+    localparam int RSP_FIFO_ELEMENTS = 2;
     logic                                              fifo_enable;
+    logic [$clog2(RSP_FIFO_ELEMENTS+1)-1:0]            fifo_elems;
     logic [FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE + $bits(dris_id_t) + $bits(ctrl_signals_t) : 0]
     fifo_data;  // {valid, data, addr}
 
@@ -485,7 +490,7 @@ module cache_controller2 #(
 
     fifo #(
         .WIDTH       (1 + FETCH_WORDS*WORD_SIZE + ADDRESS_SIZE + $bits(dris_id_t) + $bits(ctrl_signals_t)),
-        .MAX_ELEMENTS(2)
+        .MAX_ELEMENTS(RSP_FIFO_ELEMENTS)
     ) feefifofum (
         .clk, .rst_l,
         .peek_only  (core_req_stall_mem),
@@ -496,8 +501,21 @@ module cache_controller2 #(
         .deq_data   ({core_rsp_data_valid, core_rsp_data, core_rsp_addr, core_rsp_id, core_rsp_ctrl_signals}),
         .num_suc_enq(),
         .num_suc_deq(),
-        .num_q_elem ()
+        .num_q_elem (fifo_elems)
     );
+
+    // The FIFO drops enqueues silently when full, and a dropped instruction
+    // response is invisible until the register dump disagrees dozens of
+    // instructions later. The core must supply backpressure (drop core_req_re
+    // while stalled) so this can never happen; assert it rather than trust it.
+    // synopsys translate_off
+    always_ff @(posedge clk) begin
+        assert (!(rst_l && fifo_enable && !core_req_cancel &&
+                  fifo_elems == RSP_FIFO_ELEMENTS && core_req_stall_mem))
+        else $error("%0t %m: response FIFO overflow, dropped addr=%h — the core kept requesting while stalled",
+                    $time, {core_req_addr_latched, 2'b00});
+    end
+    // synopsys translate_on
 
     assign core_rsp_excpt = mem_rsp_excpt;
 

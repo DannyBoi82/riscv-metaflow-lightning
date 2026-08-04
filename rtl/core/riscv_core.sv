@@ -197,6 +197,21 @@ module riscv_core
     logic        commit_fire;
     logic [SUPERSCALAR_WAYS-1:0]        rf_commit_valid;
     logic [SUPERSCALAR_WAYS-1:0][31:0]  rf_commit_pc, rf_commit_insn;
+    RISCV_Commit::commit_mem_t [SUPERSCALAR_WAYS-1:0] rf_commit_mem;
+
+    `ifdef DEBUG
+        /* Request payload carried to W for the verify-mem seam. The access
+         * itself issues in M1 — these are the values that actually go on the
+         * bus, address included: reporting alu_out_W instead would re-derive
+         * the address the trace is supposed to be checking, and a corrupted
+         * data_addr would go unnoticed as long as loads and stores were
+         * corrupted alike. Reporting at W only delays it, and this core's
+         * memory ops are already in program order. data_load_W (the raw
+         * cache word) is already at W. */
+        logic [29:0] data_addr_M2, data_addr_W;
+        logic [31:0] data_store_M2, data_store_W;
+        logic [3:0]  data_store_mask_M2, data_store_mask_W;
+    `endif
 
     `ifdef DEBUG_PIPELINE
         // Used by TRACE ($display) and PERF (counters).
@@ -380,6 +395,7 @@ module riscv_core
         .commit_valid (rf_commit_valid),
         .commit_pc    (rf_commit_pc),
         .commit_insn  (rf_commit_insn),
+        .commit_mem   (rf_commit_mem),
         .rs1_data     (rs1_data_D),
         .rs2_data     (rs2_data_D),
         .commit_pkts  (commit_pkts));
@@ -543,6 +559,11 @@ module riscv_core
             alu_out_M2      <= alu_out_M1;
             rd_M2           <= rd_M1;
 
+            `ifdef DEBUG
+                data_addr_M2       <= data_addr;
+                data_store_M2      <= data_store;
+                data_store_mask_M2 <= data_store_mask;
+            `endif
             `ifdef DEBUG_PIPELINE
                 se_immediate_M2  <= se_immediate_M1;
             `endif
@@ -575,6 +596,11 @@ module riscv_core
             alu_out_W      <= alu_out_M2;
             rd_W           <= rd_M2;
 
+            `ifdef DEBUG
+                data_addr_W       <= data_addr_M2;
+                data_store_W      <= data_store_M2;
+                data_store_mask_W <= data_store_mask_M2;
+            `endif
             `ifdef DEBUG_PIPELINE
                 se_immediate_W  <= se_immediate_M2;
             `endif
@@ -620,6 +646,48 @@ module riscv_core
         rf_commit_valid[0] = commit_fire;
         rf_commit_pc[0]    = pc_W;
         rf_commit_insn[0]  = instr_W;
+    end
+
+    // Byte enables of a load, within its containing word: the read-side twin
+    // of lib.sv's DataStoreMaskGenerator, which only handles stores.
+    function automatic logic [3:0] load_byte_mask(ldst_mode_t ldst_mode,
+            logic [1:0] byte_offset);
+
+        unique case (ldst_mode)
+            LDST_W:           return 4'b1111;
+            LDST_H, LDST_HU:  return byte_offset[1] ? 4'b1100 : 4'b0011;
+            LDST_B, LDST_BU:  return 4'b0001 << byte_offset;
+            default:          return 4'b0000;
+        endcase
+    endfunction: load_byte_mask
+
+    // Byte enables -> bit mask, for zeroing the lanes an access didn't touch.
+    function automatic logic [31:0] expand_mask(logic [3:0] byte_mask);
+        return {{8{byte_mask[3]}}, {8{byte_mask[2]}},
+                {8{byte_mask[1]}}, {8{byte_mask[0]}}};
+    endfunction: expand_mask
+
+    /* The memory half of the commit packet (verify-mem, see riscv_commit.vh).
+     * Bus values only: the raw cache word masked to the accessed lanes, not
+     * the sign-extended value RDDataMux hands the register file — load
+     * extension is the register trace's business. */
+    always_comb begin
+        rf_commit_mem = '0;
+`ifdef DEBUG
+        if (ctrl_signals_W.memRead) begin
+            rf_commit_mem[0].addr  = {data_addr_W, byte_offset_W};
+            rf_commit_mem[0].rmask = load_byte_mask(ctrl_signals_W.ldst_mode,
+                    byte_offset_W);
+            rf_commit_mem[0].rdata = data_load_W
+                    & expand_mask(rf_commit_mem[0].rmask);
+        end
+        else if (ctrl_signals_W.memWrite) begin
+            rf_commit_mem[0].addr  = {data_addr_W, byte_offset_W};
+            rf_commit_mem[0].wmask = data_store_mask_W;
+            rf_commit_mem[0].wdata = data_store_W
+                    & expand_mask(data_store_mask_W);
+        end
+`endif
     end
 
     // ====================================================================

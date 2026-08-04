@@ -78,6 +78,9 @@
  *                  clock edge on which the packet is sampled.
  *  - commit_pc     Per way: PC of the retiring instruction.
  *  - commit_insn   Per way: encoding of the retiring instruction.
+ *  - commit_mem    Per way: the data-memory access the retiring instruction
+ *                  performed, '0 if it touched no memory (verify-mem seam;
+ *                  cores drive it only in `DEBUG builds).
  *
  * Outputs:
  *  - rs1_data  The data read from the rs1 register(s).
@@ -88,7 +91,7 @@ module register_file
     // Import the default values for the parameters
     import RISCV_UArch::SUPERSCALAR_WAYS;
     import RISCV_ISA::XLEN;
-    import RISCV_Commit::commit_pkt_t;
+    import RISCV_Commit::commit_pkt_t, RISCV_Commit::commit_mem_t;
 
     #(parameter WAYS=SUPERSCALAR_WAYS, NUM_REGS=RISCV_ISA::NUM_REGS, WIDTH=XLEN, FORWARD=0)
     (input  logic                               clk, rst_l,
@@ -97,6 +100,7 @@ module register_file
      input  logic [WAYS-1:0][WIDTH-1:0]         rd_data,
      input  logic [WAYS-1:0]                    commit_valid,
      input  logic [WAYS-1:0][WIDTH-1:0]         commit_pc, commit_insn,
+     input  commit_mem_t [WAYS-1:0]             commit_mem,
      output logic [WAYS-1:0][WIDTH-1:0]         rs1_data, rs2_data,
      output commit_pkt_t [WAYS-1:0]             commit_pkts);
 
@@ -154,6 +158,7 @@ module register_file
             commit_pkts[i].valid    = commit_valid[i];
             commit_pkts[i].pc_rdata = commit_pc[i];
             commit_pkts[i].insn     = commit_insn[i];
+            commit_pkts[i].mem      = commit_valid[i] ? commit_mem[i] : '0;
             if (commit_valid[i] && rd_we[i] && (rd[i] != 'd0)) begin
                 commit_pkts[i].rd_addr  = rd[i];
                 commit_pkts[i].rd_wdata = rd_data[i];

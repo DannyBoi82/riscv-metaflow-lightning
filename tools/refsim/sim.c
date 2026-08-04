@@ -378,6 +378,8 @@ void process_instruction(cpu_state_t *cpu_state)
                     //uint32_t aligned_addr = (addr >> 2) << 2;
                     //printf("offset: %x | reading from: %x\n", itype_imm, addr);
                     int32_t result = mem_read32(cpu_state, addr);
+                    memtrace_record(cpu_state, cpu_state->pc, false, addr,
+                            0xF, result);
                     register_write(cpu_state, rd, result);
                     cpu_state->pc = cpu_state->pc + sizeof(instr);
                     break;
@@ -391,6 +393,8 @@ void process_instruction(cpu_state_t *cpu_state)
                     // would be 0x04 in the above example
                     //grab MSB
                     int32_t result = (mem_read32(cpu_state, aligned_addr) >> (index*8)) & 0xFF;
+                    memtrace_record(cpu_state, cpu_state->pc, false, addr,
+                            0x1 << index, ((uint32_t)result) << (index*8));
                     //sign extend it
                     result = (result << 24) >> 24;
                     register_write(cpu_state, rd, result);
@@ -403,6 +407,8 @@ void process_instruction(cpu_state_t *cpu_state)
                     uint32_t aligned_addr = (addr >> 2) << 2;
                     uint32_t index = addr % 4;
                     uint32_t result = (mem_read32(cpu_state, aligned_addr) >> (index*8)) & 0xFF;
+                    memtrace_record(cpu_state, cpu_state->pc, false, addr,
+                            0x1 << index, result << (index*8));
                     register_write(cpu_state, rd, result);
                     cpu_state->pc = cpu_state->pc + sizeof(instr);
                     break;
@@ -413,6 +419,8 @@ void process_instruction(cpu_state_t *cpu_state)
                     uint32_t aligned_addr = (addr >> 2) << 2;
                     uint32_t index = addr % 4;
                     int32_t result = (mem_read32(cpu_state, aligned_addr) >> (index*8)) & 0xFFFF;
+                    memtrace_record(cpu_state, cpu_state->pc, false, addr,
+                            0x3 << index, ((uint32_t)result) << (index*8));
                     result = (result << 16) >> 16;
                     register_write(cpu_state, rd, result);
                     cpu_state->pc = cpu_state->pc + sizeof(instr);
@@ -424,6 +432,8 @@ void process_instruction(cpu_state_t *cpu_state)
                     uint32_t aligned_addr = (addr >> 2) << 2;
                     uint32_t index = addr % 4;
                     uint32_t result = (mem_read32(cpu_state, aligned_addr) >> (index*8)) & 0xFFFF;
+                    memtrace_record(cpu_state, cpu_state->pc, false, addr,
+                            0x3 << index, result << (index*8));
                     register_write(cpu_state, rd, result);
                     cpu_state->pc = cpu_state->pc + sizeof(instr);
                     break;
@@ -472,6 +482,9 @@ void process_instruction(cpu_state_t *cpu_state)
                     uint32_t new_data = (data & mask) |
                     ((register_read(cpu_state, rs2) & 0xFF) << (byte_offset * 8));
 
+                    memtrace_record(cpu_state, cpu_state->pc, true, addr,
+                            0x1 << byte_offset, new_data & ~mask);
+
                     //write it back
                     mem_write32(cpu_state, aligned_addr, new_data);
 
@@ -502,6 +515,10 @@ void process_instruction(cpu_state_t *cpu_state)
                     uint32_t new_data = (data & mask) |
                     ((register_read(cpu_state, rs2) & 0xFFFF) << (byte_offset * 8));
                     //printf("new data: %x\n", new_data);
+
+                    memtrace_record(cpu_state, cpu_state->pc, true, addr,
+                            0x3 << byte_offset, new_data & ~mask);
+
                     //write it back
                     mem_write32(cpu_state, aligned_addr, new_data);
 
@@ -515,6 +532,9 @@ void process_instruction(cpu_state_t *cpu_state)
                     
                     //dont need to do any reading this time
                     uint32_t new_data = register_read(cpu_state, rs2);
+
+                    memtrace_record(cpu_state, cpu_state->pc, true, addr,
+                            0xF, new_data);
 
                     //write it back
                     mem_write32(cpu_state, addr, new_data);

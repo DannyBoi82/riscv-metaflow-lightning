@@ -131,6 +131,14 @@ module DRIS
                         dris_entries[writeback_pkts[i].id_W.id_index].result.result_data <= writeback_pkts[i].result_data_W;
                         dris_entries[writeback_pkts[i].id_W.id_index].entry_state.mem_addr_ready <= '1;
                         dris_entries[writeback_pkts[i].id_W.id_index].entry_state.dispatched <= '0;
+
+                        `ifdef DEBUG
+                            /* Second copy of the address for the verify-mem
+                             * commit seam: result_data is clobbered by a
+                             * load's data writeback, but the seam needs the
+                             * address at retirement. */
+                            dris_entries[writeback_pkts[i].id_W.id_index].debug_mem_addr <= writeback_pkts[i].result_data_W;
+                        `endif
                     end else begin
                         dris_entries[writeback_pkts[i].id_W.id_index].result.result_data  <= writeback_pkts[i].result_data_W;
                         dris_entries[writeback_pkts[i].id_W.id_index].result.result_valid <= '1;

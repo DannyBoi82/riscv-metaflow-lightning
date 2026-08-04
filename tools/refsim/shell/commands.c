@@ -122,6 +122,28 @@ static void print_statetrace_line(cpu_state_t *cpu_state, uint32_t pc)
 }
 
 /**
+ * Records one committed memory operation to the memory-op trace file (the
+ * reference half of the verify-mem flow — see command_memtrace and
+ * scripts/check_mem_trace.py). Called from the load/store cases in
+ * process_instruction(), which already hold the address and the data; a no-op
+ * unless memtrace mode is active. Line format, matching the RTL side:
+ *
+ *      <pc> <L|S> <addr> <mask> <data>
+ *      004000a4 S 10000000 f 0000002a
+ **/
+void memtrace_record(cpu_state_t *cpu_state, uint32_t pc, bool is_store,
+        uint32_t addr, uint32_t mask, uint32_t data)
+{
+    if (!cpu_state->memtrace_mode) {
+        return;
+    }
+
+    fprintf(cpu_state->memtrace_fd, "%08x %c %08x %01x %08x\n", pc,
+            is_store ? 'S' : 'L', addr, mask & 0xF, data);
+    return;
+}
+
+/**
  * Run the simulator for a single cycle, incrementing the instruction count.
  **/
 static void run_simulator(cpu_state_t *cpu_state)
@@ -747,6 +769,9 @@ static const int TRACE_NUM_ARGS       = 0;
 // The maximum number of arguments for the statetrace command (trace file)
 static const int STATETRACE_MAX_NUM_ARGS = 1;
 
+// The maximum number of arguments for the memtrace command (trace file)
+static const int MEMTRACE_MAX_NUM_ARGS  = 1;
+
 // The expected number of arguments for the quit command
 static const int QUIT_NUM_ARGS          = 0;
 
@@ -840,6 +865,39 @@ void command_statetrace(cpu_state_t *cpu_state, char *args[], int num_args)
         print_statetrace_line(cpu_state, cpu_state->pc);
     } else {
         fclose(cpu_state->statetrace_fd);
+    }
+    return;
+}
+
+/**
+ * Toggles memory-operation tracing mode for the simulator.
+ *
+ * While active, the simulator writes one line per load/store the program
+ * performs (see memtrace_record) to the given file, or "memtrace.txt" if no
+ * file was specified. There is no anchor line: the file holds memory ops only,
+ * so the RTL's committed memory ops line up with it one for one. This is the
+ * verify-mem format that RTL memory traces are diffed against.
+ **/
+void command_memtrace(cpu_state_t *cpu_state, char *args[], int num_args)
+{
+    // Check that the appropriate number of arguments was specified
+    if (num_args > MEMTRACE_MAX_NUM_ARGS) {
+        fprintf(stderr, "Error: Too many arguments specified to 'memtrace' "
+                "command.\n");
+        return;
+    }
+
+    // Toggle the memory-trace mode for the processor
+    cpu_state->memtrace_mode = !cpu_state->memtrace_mode;
+    if (cpu_state->memtrace_mode) {
+        const char *path = (num_args > 0) ? args[0] : "memtrace.txt";
+        cpu_state->memtrace_fd = fopen(path, "w");
+        if (!cpu_state->memtrace_fd) {
+            perror("Failed to open memory trace file");
+            exit(1);
+        }
+    } else {
+        fclose(cpu_state->memtrace_fd);
     }
     return;
 }
@@ -945,6 +1003,11 @@ void command_help(cpu_state_t *cpu_state, char *args[], int num_args)
             "written per executed instruction (plus an initial anchor line) "
             "to the given file (default statetrace.txt). This is the "
             "verify-trace format the RTL commit trace is diffed against.");
+    print_help("memtrace (file)?", "Toggles memory-operation tracing. While "
+            "active, one line is written per load/store the program performs "
+            "(pc, L|S, address, byte mask, lane-aligned data) to the given "
+            "file (default memtrace.txt). This is the verify-mem format the "
+            "RTL memory trace is diffed against.");
     print_help("q[uit]", "Quit the simulator. Can also be done with an EOF "
             "(CTRL-D).");
     print_help("h[elp]|?", "Display this help message.");

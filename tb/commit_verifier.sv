@@ -16,6 +16,11 @@
  *    x1..x31 in hex, with a ` #cycle=N` comment the checker strips. An
  *    initial anchor line (reset state, PC = USER_TEXT_START) is printed
  *    so a reset-state mismatch is caught at commit 0.
+ *  - With the `+mem_trace` plusarg: print one line per *committed memory op*
+ *    (pc, L|S, address, byte mask, lane-aligned data) to mem_trace.txt — the
+ *    verify-mem flow, diffed against the reference simulator's `memtrace`
+ *    output by scripts/check_mem_trace.py. Cores fill the packet's `mem`
+ *    field only in `DEBUG builds, so the file is empty without the define.
  *  - At halt: the end-of-run register dump (stdout + simulation.reg +
  *    simulation.reg2), from the shadow state *including* any commits that
  *    land on the halt edge itself. A run that ends *without* halting (the
@@ -82,6 +87,9 @@ module commit_verifier
     // Commit trace file; 0 when tracing is disabled
     int trace_fd = 0;
 
+    // Memory-op trace file (+mem_trace); 0 when tracing is disabled
+    int mem_trace_fd = 0;
+
     /* Set once the end-of-run dump has been written, so the `final` fallback
      * below doesn't dump a second time over a normal halting run. Cleared in
      * reset rather than at declaration: VCS counts a declaration initializer
@@ -98,6 +106,12 @@ module commit_verifier
             anchor = reset_state();
             print_state_line(trace_fd, USER_TEXT_START, anchor, 0, '0);
         end
+        /* The memory trace holds memory ops only, so it has no anchor line:
+         * line k is the k-th committed load/store, which is exactly how the
+         * refsim's memtrace is indexed. */
+        if ($test$plusargs("mem_trace")) begin
+            mem_trace_fd = $fopen("mem_trace.txt", "w");
+        end
     end : trace_setup
 
     /* The dump normally happens on the halt edge below. This is the fallback
@@ -111,6 +125,9 @@ module commit_verifier
     final begin
         if (trace_fd != 0) begin
             $fclose(trace_fd);
+        end
+        if (mem_trace_fd != 0) begin
+            $fclose(mem_trace_fd);
         end
         if (!dumped) begin
             dump_registers(shadow);
@@ -135,6 +152,10 @@ module commit_verifier
                     if (trace_fd != 0) begin
                         print_state_line(trace_fd, commit_pkts[i].pc_rdata,
                                 upd, top.cycle_count, commit_pkts[i].insn);
+                    end
+                    if (mem_trace_fd != 0) begin
+                        print_mem_line(mem_trace_fd, commit_pkts[i],
+                                top.cycle_count);
                     end
                 end
             end
@@ -170,6 +191,42 @@ module commit_verifier
         end
         $fwrite(fd, " #cycle=%0d insn=%x\n", cycle, insn);
     endfunction: print_state_line
+
+    /* Prints one memory-op trace line for a committed instruction that touched
+     * memory, and nothing at all for one that did not:
+     *
+     *     <pc> <L|S> <addr> <mask> <data>   #cycle=N insn=X
+     *     004000a4 S 10000000 f 0000002a    #cycle=41 insn=00a12023
+     *
+     * This is the RTL half of verify-mem; the reference simulator's `memtrace`
+     * command writes the same five fields (see scripts/check_mem_trace.py,
+     * which strips the '#' comment). Ops appear in retirement order, which is
+     * program order, so a core that reorders memory *internally* still emits a
+     * comparable trace — what the diff catches is a memory op that is missing,
+     * extra, out of order, or carrying the wrong address/lanes/data.
+     *
+     * The packet must not claim to both read and write; that is a core bug,
+     * not a trace ambiguity, so flag it rather than silently picking one. */
+    function automatic void print_mem_line(int fd, commit_pkt_t pkt,
+            input int cycle);
+
+        logic is_load;
+
+        if ((pkt.mem.rmask == 4'd0) && (pkt.mem.wmask == 4'd0)) begin
+            return;
+        end
+        if ((pkt.mem.rmask != 4'd0) && (pkt.mem.wmask != 4'd0)) begin
+            $fatal(1, "commit packet at pc %x claims both a read (mask %x) and a write (mask %x)",
+                    pkt.pc_rdata, pkt.mem.rmask, pkt.mem.wmask);
+        end
+
+        is_load = (pkt.mem.rmask != 4'd0);
+        $fwrite(fd, "%x %s %x %x %x #cycle=%0d insn=%x\n", pkt.pc_rdata,
+                is_load ? "L" : "S", pkt.mem.addr,
+                is_load ? pkt.mem.rmask : pkt.mem.wmask,
+                is_load ? pkt.mem.rdata : pkt.mem.wdata,
+                cycle, pkt.insn);
+    endfunction: print_mem_line
 
     // Dumps the end-of-run register state to stdout and the .reg files
     function automatic void dump_registers(

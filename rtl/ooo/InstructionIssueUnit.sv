@@ -126,6 +126,7 @@ module InstructionIssueUnit #(
 
     logic            redirect, ct_redirect;
     logic [XLEN-1:0] redirect_pc, ct_resume_pc;
+    logic            intake_stall;
 
     /* =================================================================
      * Fetch request / PC maintenance
@@ -133,7 +134,16 @@ module InstructionIssueUnit #(
     logic [XLEN-1:0] pc_F;   // byte address of the next fetch request
     logic [XLEN-1:0] next_pc;
 
-    assign core_req_re     = 1'b1;      // the front end always wants instructions
+    // Real backpressure, not just a hold on the response head.
+    // core_req_stall_mem (peek_only) keeps the FIFO's *head* in place, but it
+    // does not stop the controller: on a hit it enqueues a response and chains
+    // the next probe every cycle. The response FIFO is 2 deep and drops
+    // enqueues silently when full, so a stall lasting more than two cycles
+    // vaporized whole fetch groups whose PCs pc_F had already marched past —
+    // instructions that were never refetched (memtest2 lost 0x4000a0-0x4000ac
+    // outright). Dropping the request while stalled bounds the outstanding
+    // work at one held head + one in-flight probe = exactly the FIFO's depth.
+    assign core_req_re     = !intake_stall;
     assign core_req_addr   = pc_F[2 +: ADDRESS_SIZE];
     assign core_req_cancel = redirect;
 
@@ -152,10 +162,14 @@ module InstructionIssueUnit #(
     // Redirect must win over the stall hold: mispredict_valid is a one-cycle
     // pulse and core_rsp_ready can be low while the controller works a miss,
     // so "hold while stalled" alone would drop the repair PC.
+    // core_rsp_ready alone is not "accepted": the controller holds ready high
+    // in states where it would take a request, so pc_F must also see that we
+    // actually made one (core_req_re) — otherwise a stalled cycle silently
+    // skips a group's worth of PCs.
     always_comb begin : next_pc_mux
-        if (redirect)            next_pc = redirect_pc;
-        else if (core_rsp_ready) next_pc = seq_next_fetch;  // request accepted
-        else                     next_pc = pc_F;            // stalled: hold
+        if (redirect)                            next_pc = redirect_pc;
+        else if (core_rsp_ready && core_req_re)  next_pc = seq_next_fetch;
+        else                                     next_pc = pc_F;  // hold
     end : next_pc_mux
 
     always_ff @(posedge clock, negedge reset_n) begin : pc_reg
@@ -324,7 +338,7 @@ module InstructionIssueUnit #(
     logic [DRIS_ID_WIDTH:0] occupancy;
     assign occupancy = fetch_ptr - retire_ptr;  // color-bit MSB makes this mod-2N
 
-    logic dris_room, shelf_room, intake_stall, issue_fire;
+    logic dris_room, shelf_room, issue_fire;  // intake_stall declared above
     assign dris_room    = (DRIS_NUM_ENTRIES - int'(occupancy)) >= int'(group_count);
     assign shelf_room   = int'(shelf_free_count) >= int'(ct_count);
     assign intake_stall = core_rsp_data_valid && (!dris_room || !shelf_room);

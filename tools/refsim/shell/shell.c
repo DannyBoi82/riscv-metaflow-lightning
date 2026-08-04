@@ -219,6 +219,8 @@ static bool process_long_command(cpu_state_t *cpu_state, const char *command,
         command_trace(cpu_state, args, num_args);
     } else if (strcmp(command, "statetrace") == 0) {
         command_statetrace(cpu_state, args, num_args);
+    } else if (strcmp(command, "memtrace") == 0) {
+        command_memtrace(cpu_state, args, num_args);
     } else if (strcmp(command, "quit") == 0) {
         *quit = command_quit(cpu_state, args, num_args);
     } else if (strcmp(command, "help") == 0) {

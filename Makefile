@@ -539,6 +539,44 @@ verify-trace: reftrace | check-test-defined
 		exit 1; \
 	fi
 
+################################################################################
+# Verify-mem: per-memory-op compare vs the reference sim. Where verify-trace
+# checks architectural *register* state, this checks what actually reached data
+# memory: every committed load/store's address, byte lanes and data, in commit
+# order. Divergences are classified as missing / extra / out-of-order / wrong
+# value, which is where an OoO core's memory bugs live.
+#
+# The core-side drives are `ifdef DEBUG (they cost an address field per
+# in-flight instruction), so this builds with +define+DEBUG; the flags stamp
+# rebuilds automatically when switching in and out of it.
+################################################################################
+
+.PHONY: refmemtrace verify-mem
+
+REF_MEM_TRACE = $(OUTPUT)/refmemtrace.txt
+RTL_MEM_TRACE = $(OUTPUT)/mem_trace.txt
+MEM_CHECKER = python3 scripts/check_mem_trace.py
+
+refmemtrace: $(TEST_BIN) $(REFSIM_EXECUTABLE) $(TEST) | $(OUTPUT) assemble \
+		check-test-defined
+	@printf "Generating $u$(REF_MEM_TRACE)$n from reference sim on test $u$(TEST)$n...\n"
+	@printf "memtrace $(abspath $(REF_MEM_TRACE))\ngo\nquit\n" | \
+			$(REFSIM_EXECUTABLE) $(TEST)
+
+verify-mem: refmemtrace | check-test-defined
+	@rm -f $(RTL_MEM_TRACE)  # a run without tracing must not leave a stale trace
+	@$(MAKE) --no-print-directory sim TEST=$(TEST) OUTPUT=$(OUTPUT) \
+			PARAMS='$(PARAMS) +define+DEBUG' \
+			PLUSARGS='$(PLUSARGS) +mem_trace'
+	@printf "\nComparing the RTL memory trace against the reference...\n"
+	@if $(MEM_CHECKER) $(RTL_MEM_TRACE) $(REF_MEM_TRACE); then \
+		printf "$gCorrect! The RTL memory operations match the reference.$n\n"; \
+	else \
+		printf "\n%-67s\t%s\n" "$u$(RTL_MEM_TRACE)$n" "$u$(REF_MEM_TRACE)$n"; \
+		printf "$rIncorrect! The RTL memory operations diverge from the reference.$n\n"; \
+		exit 1; \
+	fi
+
 # The in-repo reference simulator is built on demand; any other path
 # (e.g. the AFS class binary) must already exist.
 $(REFSIM_LOCAL): $(wildcard tools/refsim/*.c tools/refsim/*/*.c \
@@ -631,6 +669,11 @@ help:
 	@printf "\t          committed instruction against the reference sim\n"
 	@printf "\t          (see README; needs a core that emits commit packets).\n"
 	@printf "\t$breftrace$n  Generate the reference per-commit state trace only.\n"
+	@printf "\t$bverify-mem$n  Compare every committed memory operation (address,\n"
+	@printf "\t          byte lanes, data) against the reference sim, reporting\n"
+	@printf "\t          missing / extra / out-of-order / wrong-value ops.\n"
+	@printf "\t          Builds with $b+define+DEBUG$n (the core-side seam).\n"
+	@printf "\t$brefmemtrace$n  Generate the reference memory-op trace only.\n"
 	@printf "\t$bregress$n   Run verify on every test with a .reg oracle\n"
 	@printf "\t          (or on $bTESTS$n if given).\n"
 	@printf "\t$bsim$n       Run $bTEST$n without verification.\n"
