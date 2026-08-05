@@ -11,7 +11,7 @@
 # ------------------------------------------------------------------------
 # Simulator backend: verilator (default, runs anywhere) or vcs (AFS hosts)
 # ------------------------------------------------------------------------
-SIM ?= verilator
+SIM ?= vcs
 
 # ------------------------------------------------------------------------
 # Core selection: which riscv_core_interface implementation to build.

@@ -16,7 +16,7 @@
  *   x11 = 1   (Case B passed — branch on rs2 taken correctly)
  *   x12 = 1   (Case C passed — branch NOT taken correctly)
  *
- * If any register = 0xBAD, that case failed.
+ * If any register = 0x69, that case failed.
  **/
 
 #define DATA_SEG_SIZE   8
@@ -38,12 +38,12 @@ main:
     //   beq x5, x6, HIT_A      branch if x5 == 42
     //
     // x5 is in E when beq is in D — stall controller must catch this.
-    // Without stall: x5 is garbage, branch likely not taken → x10 = 0xBAD
+    // Without stall: x5 is garbage, branch likely not taken → x10 = 0x69
     //------------------------------------------------------------------
     addi    x6,  zero, 42       // x6 = 42 (compare target)
     lw      x5,  0(x1)          // x5 = 42
     beq     x5,  x6,  HIT_A    // rs1 hazard: should branch
-    addi    x10, zero, 0xBAD
+    addi    x10, zero, 0x69
     jal     x0,  CASE_B
 HIT_A:
     addi    x10, zero, 1        // x10 = 1 means Case A passed
@@ -59,7 +59,7 @@ CASE_B:
     addi    x6,  zero, 42       // x6 = 42
     lw      x5,  0(x1)          // x5 = 42
     beq     x6,  x5,  HIT_B    // rs2 hazard: should branch
-    addi    x11, zero, 0xBAD
+    addi    x11, zero, 0x69
     jal     x0,  CASE_C
 HIT_B:
     addi    x11, zero, 1        // x11 = 1 means Case B passed
@@ -70,7 +70,7 @@ HIT_B:
     //   bne x5, x6, MISS_C     branch if x5 != 99 — should NOT branch
     //                          since x5 == 42 != 99
     //
-    // Without stall: x5 is garbage, branch may be taken → x12 = 0xBAD
+    // Without stall: x5 is garbage, branch may be taken → x12 = 0x69
     // This catches the inverse: stall incorrectly suppressed on not-taken.
     //------------------------------------------------------------------
 CASE_C:
@@ -80,7 +80,7 @@ CASE_C:
     addi    x12, zero, 1        // x12 = 1 means Case C passed (fall-through correct)
     jal     x0,  DONE
 MISS_C:
-    addi    x12, zero, 0xBAD    // should NOT be reached
+    addi    x12, zero, 0x69    // should NOT be reached
 
 DONE:
     addi    a0,  zero, 0xa
