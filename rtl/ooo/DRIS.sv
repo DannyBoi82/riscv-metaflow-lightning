@@ -175,13 +175,36 @@ module DRIS
                 end
             end: dispatched_bit_set
 
-            // clearing valid bit on retirement (from ssc)
+            // clearing valid bits on retirement (from ssc)
             for (int i = 0; i < ENTRIES; i++) begin: valid_bit_clear
                 if (clear_valid[i]) begin
                     dris_entries[i].entry_state.valid <= '0;
+                    dris_entries[i].entry_state.dispatched <= '0;
+                    dris_entries[i].entry_state.executed <= '0;
+                    dris_entries[i].entry_state.mem_addr_ready <= '0;
+                    dris_entries[i].entry_state.trap <= '0;
+
                     dris_entries[i].id.id_valid <= '0;
+                    dris_entries[i].locker_1.locker_valid <= '0;
+                    dris_entries[i].locker_2.locker_valid <= '0;
+                    dris_entries[i].result.result_valid <= '0;
                 end
             end: valid_bit_clear
+
+            for (int i = 0; i < ENTRIES; i++) begin: locker_valid_bit_clear
+                if (clear_valid[i]) begin
+                    for (int j = 0; j < ENTRIES; j++) begin
+                        if (dris_entries[j].locker_1.locker_color == dris_entries[i].id.id_color &&
+                            dris_entries[j].locker_1.locker_id == dris_entries[i].id.id_index) begin
+                            dris_entries[j].locker_1.locker_valid <= '0;
+                        end
+                        if (dris_entries[j].locker_2.locker_color == dris_entries[i].id.id_color &&
+                            dris_entries[j].locker_2.locker_id == dris_entries[i].id.id_index) begin
+                            dris_entries[j].locker_2.locker_valid <= '0;
+                        end
+                    end
+                end
+            end: locker_valid_bit_clear
 
         end: array_update_logic
     end: DRIS_ff

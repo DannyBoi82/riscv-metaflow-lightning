@@ -55,9 +55,11 @@ anchor  pc=00400000 cycle=0 time=0 insn=00000000   x1(ra)=00000000  x2(sp)=7ff00
 #54     pc=00400084 cycle=177 time=17600 insn=00a90933   x18(s2)=00000002
 #55     pc=00400088 cycle=177 time=17600 insn=00140413   x8(s0/fp)=00000003
 #56     pc=0040008c cycle=179 time=17800 insn=0089a7b3   x15(a5)=00000000
+
 #57     pc=00400090 cycle=181 time=18000 insn=fff78793   x15(a5)=ffffffff
 #58     pc=00400094 cycle=183 time=18200 insn=00f47433   x8(s0/fp)=00000000
 #59     pc=00400098 cycle=183 time=18200 insn=fff48493   x9(s1)=000001bd
+    
 #60     pc=0040009c cycle=183 time=18200 insn=fc049ee3
 #61     pc=00400078 cycle=185 time=18400 insn=00040513   x10(a0)=00000000
 #62     pc=0040007c cycle=186 time=18500 insn=00000097   x1(ra)=0040007c

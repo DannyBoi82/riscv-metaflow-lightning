@@ -8,3 +8,4 @@ in order of discovery
 5b. ssc needs to index into dris with DRIS_ENTRIES-1 bits to not include the color bit and walk off the end of the dris array.
 6. ssc RETIRES_PER_CYCLE cant be > than #of reg file write ports (killed memtest2 because that was the first time the ssc slots were filled that much)
 7. the number of control flow instructions/ fetch group needs to be <= the size of the branch shelf. crazy.
+8. you actually need to clear locker_valid if the dependency retires

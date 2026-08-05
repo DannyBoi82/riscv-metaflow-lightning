@@ -63,6 +63,12 @@
 `define LTG_DRIS_ENTRIES 8
 `endif
 
+// DRIS entries the scheduler checks for readiness each cycle
+`ifndef LTG_SCHED_ENTRIES_CHECKED
+`define LTG_SCHED_ENTRIES_CHECKED 4
+`endif
+
+
 // Instructions fetched/renamed per cycle
 `ifndef LTG_FETCH_WAYS
 `define LTG_FETCH_WAYS 4
@@ -98,10 +104,6 @@
 `define LTG_BRANCH_SHELF_ENTRIES 4
 `endif
 
-// DRIS entries the scheduler checks for readiness each cycle
-`ifndef LTG_SCHED_ENTRIES_CHECKED
-`define LTG_SCHED_ENTRIES_CHECKED 4
-`endif
 
 /*----------------------------------------------------------------------------
  * Memory model timing and clock (consumed by rtl/include/riscv_uarch.vh)
