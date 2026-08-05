@@ -1,0 +1,25 @@
+- name: Setup riscv-gnu-toolchain
+  # You may pin to the exact commit or the version.
+  # uses: colinaaa/setup-riscv-gnu-toolchain@f2e57f05178a0353db6118234a8390c53da5a756
+  uses: colinaaa/setup-riscv-gnu-toolchain@v1.0.2
+  with:
+    # When the toolchain released
+    release-date: # optional, default is 2020.08-1
+
+- name: Run Verilator
+  # You may pin to the exact commit or the version.
+  # uses: fossi-foundation/verilator-action@95b33dc045437acc785ca5f8bf6ffac64d383233
+  uses: fossi-foundation/verilator-action@v0.3
+  with:
+    # The version of Verilator to use
+    version: # optional, default is latest
+    # The working directory to run Verilator in
+    working-directory: # optional
+    # The arguments to pass to Verilator
+    arguments: # optional
+    # The command to run with Verilator
+    run: # optional
+    # The files to lint with Verilator
+    lint-files: # optional
+    # Files with lint waivers to apply
+    lint-waivers: # optional
