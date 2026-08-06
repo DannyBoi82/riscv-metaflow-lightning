@@ -9,3 +9,4 @@ in order of discovery
 6. ssc RETIRES_PER_CYCLE cant be > than #of reg file write ports (killed memtest2 because that was the first time the ssc slots were filled that much)
 7. the number of control flow instructions/ fetch group needs to be <= the size of the branch shelf. crazy.
 8. you actually need to clear locker_valid if the dependency retires
+9. you need to not clear locker valid on lockers that are currently being written to. raceish condition where the clear valid check happens after the new writes, so a new locker computed correctly could be eaten by a clear valid from something that retired this cycle.

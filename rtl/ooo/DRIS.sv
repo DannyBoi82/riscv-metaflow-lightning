@@ -63,6 +63,16 @@ module DRIS
     // track the lockers for the source registers of incoming instructions
     dris_locker_t [FETCH_WAYS-1:0] locker_1_comb, locker_2_comb;
 
+    // entries taking a newborn from fetch this cycle (retirement's locker
+    // cleanup must keep its hands off them — see locker_valid_bit_clear)
+    logic [ENTRIES-1:0] fetch_write_mask;
+    always_comb begin: fetch_write_mask_gen
+        fetch_write_mask = '0;
+        for (int i = 0; i < FETCH_WAYS; i++) begin
+            if (fetch_pkts[i].valid_R) fetch_write_mask[new_ids[i].id_index] = 1'b1;
+        end
+    end: fetch_write_mask_gen
+
     always_ff @(posedge clock, negedge reset_n) begin: DRIS_ff
         if (!reset_n) begin: reset_logic
             dris_entries <= '{default: '0};
@@ -191,16 +201,37 @@ module DRIS
                 end
             end: valid_bit_clear
 
+            /* A retiring producer's value moves to the register file, so its
+             * dependents must stop sourcing the operand from its DRIS entry
+             * (the slot gets recycled and `result` zeroed on intake).
+             *
+             * Two guards:
+             *  - `locker_valid` on the *watcher*: the "no dependency" sentinel
+             *    from dependency_in_dris is {id_valid 0, color 0, index all-1s},
+             *    which aliases the id of the highest-index entry in color 0.
+             *    Without the guard, that entry retiring clears every sentinel
+             *    locker in the DRIS — harmless for entries at rest, fatal in
+             *    combination with the next one.
+             *  - `!fetch_write_mask[j]`: entry j may be taking a newborn from
+             *    fetch this very cycle. This loop sits *after* fetch_writes in
+             *    the same always_ff, so it reads the OLD occupant's locker
+             *    fields and its NBA overwrites the fresh locker_valid. The
+             *    newborn's own lockers are computed against this cycle's DRIS
+             *    state (including clear_valid, below), so they need no fixup. */
             for (int i = 0; i < ENTRIES; i++) begin: locker_valid_bit_clear
                 if (clear_valid[i]) begin
                     for (int j = 0; j < ENTRIES; j++) begin
-                        if (dris_entries[j].locker_1.locker_color == dris_entries[i].id.id_color &&
-                            dris_entries[j].locker_1.locker_id == dris_entries[i].id.id_index) begin
-                            dris_entries[j].locker_1.locker_valid <= '0;
-                        end
-                        if (dris_entries[j].locker_2.locker_color == dris_entries[i].id.id_color &&
-                            dris_entries[j].locker_2.locker_id == dris_entries[i].id.id_index) begin
-                            dris_entries[j].locker_2.locker_valid <= '0;
+                        if (!fetch_write_mask[j]) begin
+                            if (dris_entries[j].locker_1.locker_valid &&
+                                dris_entries[j].locker_1.locker_color == dris_entries[i].id.id_color &&
+                                dris_entries[j].locker_1.locker_id == dris_entries[i].id.id_index) begin
+                                dris_entries[j].locker_1.locker_valid <= '0;
+                            end
+                            if (dris_entries[j].locker_2.locker_valid &&
+                                dris_entries[j].locker_2.locker_color == dris_entries[i].id.id_color &&
+                                dris_entries[j].locker_2.locker_id == dris_entries[i].id.id_index) begin
+                                dris_entries[j].locker_2.locker_valid <= '0;
+                            end
                         end
                     end
                 end
@@ -216,6 +247,8 @@ module DRIS
     logic fetch_group_dep2_valid [FETCH_WAYS-1:0];
     logic dep1_completing_now [FETCH_WAYS-1:0];
     logic dep2_completing_now [FETCH_WAYS-1:0];
+    logic dep1_retiring_now [FETCH_WAYS-1:0];
+    logic dep2_retiring_now [FETCH_WAYS-1:0];
 
     // Same-cycle intake bypass: a dependent arriving from fetch in the exact
     // cycle its producer's completing writeback fires must not lock — the
@@ -238,6 +271,19 @@ module DRIS
         return 1'b0;
     endfunction
 
+    /* Same-cycle retirement bypass: a dependent arriving from fetch in the
+     * cycle its producer retires must be born with locker_valid = 0. The
+     * producer's value lands in the register file on this same edge, and its
+     * DRIS slot is about to be recycled (intake zeroes `result`), so the
+     * operand mux has to read the register file from now on. The retirement
+     * cleanup loop can't do this for us — it reads the slot's *old* locker
+     * fields, not the newborn's. Intra-fetch-group producers are exempt:
+     * their "id" names a slot being filled this cycle, not a retiring one. */
+    function automatic logic retiring_now(dris_id_t dep);
+        return dep.id_valid && clear_valid[dep.id_index] &&
+               dris_entries[dep.id_index].id.id_color == dep.id_color;
+    endfunction
+
     always_comb begin: locker_init_comb_logic
 
         for (int q = 0; q < FETCH_WAYS; q++) begin
@@ -245,6 +291,10 @@ module DRIS
             dep2[q] = {'0, '0, {DRIS_ID_WIDTH{1'b1}}}; // no dependency on x0
             fetch_group_dep1_valid[q] = '0;
             fetch_group_dep2_valid[q] = '0;
+            dep1_completing_now[q]    = '0;
+            dep2_completing_now[q]    = '0;
+            dep1_retiring_now[q]      = '0;
+            dep2_retiring_now[q]      = '0;
         end
 
         for (int i = 0; i < FETCH_WAYS; i++) begin
@@ -273,6 +323,9 @@ module DRIS
                 dep1_completing_now[i] = completing_wb(dep1[i]);
                 dep2_completing_now[i] = completing_wb(dep2[i]);
 
+                dep1_retiring_now[i] = retiring_now(dep1[i]) & ~fetch_group_dep1_valid[i];
+                dep2_retiring_now[i] = retiring_now(dep2[i]) & ~fetch_group_dep2_valid[i];
+
                 locker_1_comb[i].locker_id      = dep1[i].id_index;
                 locker_1_comb[i].locker_color   = dep1[i].id_color;
 
@@ -283,7 +336,7 @@ module DRIS
                 !dep1_completing_now[i]) |
                 fetch_group_dep1_valid[i]; // intra-fetch-group dependency always locks
 
-                locker_1_comb[i].locker_valid   = dep1[i].id_valid;
+                locker_1_comb[i].locker_valid   = dep1[i].id_valid & ~dep1_retiring_now[i];
 
                 locker_2_comb[i].locker_id      = dep2[i].id_index;
                 locker_2_comb[i].locker_color   = dep2[i].id_color;
@@ -296,7 +349,7 @@ module DRIS
                 !dris_entries[dep2[i].id_index].result.result_valid &
                 !dep2_completing_now[i]) |
                 fetch_group_dep2_valid[i]; // intra-fetch-group dependency always locks
-                locker_2_comb[i].locker_valid   = dep2[i].id_valid;
+                locker_2_comb[i].locker_valid   = dep2[i].id_valid & ~dep2_retiring_now[i];
             end else begin
                 locker_1_comb[i] = '0;
                 locker_2_comb[i] = '0;
