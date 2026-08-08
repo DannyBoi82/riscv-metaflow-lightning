@@ -33,7 +33,7 @@ import internal_defines_pkg::*;
 
 // Trace & perf are simulation-only. Comment out before synthesis / submission.
 //`define TRACE
-//`define PERF
+`define PERF
 
 // Either TRACE or PERF needs the per-stage instr/imm tracking signals to
 // exist. DEBUG_PIPELINE is the umbrella define for "any debug propagation".
