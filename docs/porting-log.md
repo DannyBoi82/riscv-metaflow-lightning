@@ -420,3 +420,52 @@ anywhere — the reset window contains no clock edge by design.
   box, and conda's verilator 5.046 dies with "Verilator internal fault"
   on this design (same species as the documented GCC-miscompile
   segfaults — needs a -O1 rebuild if Verilator is wanted here).
+
+## 2026-08-07: perf benchmarks — `RISCV_ARCH=rv32im` was leaking into C
+
+`tests/perf/*` produced wrong results on **both** cores, including the
+known-good `CORE=inorder` rig, and on old commits as well as HEAD. Not a
+core bug and not the missing headers: the `RISCV_ARCH ?= rv32im` knob added
+on 2026-07-07 so binutils would encode `mul` in the three class **asm**
+tests was wired into the single shared `RISCV_CFLAGS`, so it applied to C
+compilation too. GCC given rv32im emits MUL/DIV for ordinary C, and nothing
+in this repo decodes M (`FUNCT7_MULDIV` in `rtl/include/riscv_isa.vh` is
+declared and never used) — so the benchmarks executed garbage.
+
+Evidence, against the pre-OoO commit of the old repo that is known to run
+these correctly (`metaflow-lightning` @ da293d0, `-march=rv32i`):
+
+- `*.c`, `*.h`, `*.data.bin`, and the `.reg` oracles were already
+  byte-identical between the repos — only `*.text.bin` differed.
+- M-extension instruction counts in the new repo's disassembly: dhrystone 6,
+  fft 40, spmv 2, kosarajus 0 — and kosarajus was the one benchmark whose
+  `.text.bin` already matched. That is the whole diagnosis in one line.
+- Rebuilding with `-march=rv32i` reproduces all 16 old `.{text,data,ktext,
+  kdata}.bin` files byte-for-byte.
+
+Fix: `-march` is now per source language, since the two have opposite needs.
+
+- `config.mk`: `RISCV_ARCH ?= rv32im` (`.S` only — lets the assembler encode
+  the mul tests) and a new `RISCV_ARCH_C ?= rv32i` (`.c`).
+- `Makefile`: `-march` moved out of the shared `RISCV_CFLAGS` into
+  `RISCV_C_ONLY_FLAGS` / `RISCV_AS_ONLY_FLAGS`, one per ELF rule.
+
+Also fixed here: the `.c` ELF rule had no header prerequisites, so dropping
+`tests/perf/*.h` into place did not invalidate the stale `.elf`/`.bin` and
+`make assemble` silently did nothing — which is what made this look like a
+core misbehavior rather than a build one. The rule now depends on
+`$(TEST_HEADERS)` = the `.h` files sitting next to the test.
+
+Verified on VCS, `CORE=inorder`: dhrystone, kosarajus, spmv, fft all report
+"Correct!" against the committed oracles, with no `RISCV_ARCH` override.
+
+Two corrections to earlier entries in this log:
+
+- "tests/c + tests/perf oracles are class-toolchain-coupled" (2026-07-07)
+  overstated the problem for perf. On this AFS host the detected toolchain
+  reproduces the class binaries exactly, so all four perf oracles match with
+  zero residue diff. The residue caveat still holds for local non-AFS GCC.
+- `tests/c/mmmIntRV32I` and `tests/c/mmmFpRV32I` were contaminated the same
+  way (1 and 4 M-instructions); they build clean now. The other 13 C tests
+  were never affected — GCC found no reason to emit MUL for them, which is
+  exactly why this went unnoticed for a month.

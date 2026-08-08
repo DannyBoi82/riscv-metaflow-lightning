@@ -16,7 +16,7 @@ structure changes.
 - `CORE=lightning|inorder` (config.mk) — which core the harness wraps; the
   in-order class core is the known-good rig for harness work
 - `make regress TESTS='tests/asm/*.S'` — suite; omit TESTS for everything
-  with an oracle (C tests are slow and currently can't pass — see below)
+  with an oracle (C tests are slow; see "Ground truth" for what passes)
 - `make lint` — verilator -Wall with `lint.vlt` waivers; keep it at zero
 - `make waves TEST=...` — FST + gtkwave
 - `make refdump TEST=...` — reference register dump (`refdump.reg`) from
@@ -45,7 +45,15 @@ structure changes.
   `~/lab4b-vl` rig, see porting log).
 - tests/c and tests/perf `.reg` oracles are class-toolchain-coupled
   (caller-saved register residue). Local GCC ≠ class GCC ⇒ residue diffs,
-  not bugs.
+  not bugs. On AFS this does not bite: all four tests/perf benchmarks
+  (dhrystone, fft, kosarajus, spmv) verify clean on `CORE=inorder` under
+  VCS, byte-identical binaries to the pre-OoO reference build.
+- **C is compiled `-march=rv32i` (`RISCV_ARCH_C`), assembly `rv32im`
+  (`RISCV_ARCH`).** Do not collapse these back into one knob. Nothing here
+  decodes M, so any MUL/DIV GCC emits for ordinary C silently corrupts
+  results — that is exactly what broke tests/perf for a month (porting log,
+  2026-08-07). rv32im on the `.S` side only exists so binutils can encode
+  the 3 class mul tests, which still fail at runtime as expected.
 
 ## Conventions
 

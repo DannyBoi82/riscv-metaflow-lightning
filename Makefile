@@ -73,7 +73,8 @@ veryclean: clean assemble-veryclean
 ################################################################################
 
 # Auto-detect the toolchain prefix when not pinned in config.mk. All builds
-# use -march=$(RISCV_ARCH) -mabi=ilp32, so any rv32-capable prefix works.
+# use -mabi=ilp32 with -march=$(RISCV_ARCH) (.S) or -march=$(RISCV_ARCH_C)
+# (.c), so any rv32-capable prefix works.
 ifeq ($(strip $(RISCV_PREFIX)),)
     RISCV_PREFIX := $(firstword $(foreach p,$(RISCV_TOOLCHAIN_CANDIDATES),\
             $(if $(shell command -v $(p)gcc 2> /dev/null),$(p))))
@@ -123,10 +124,20 @@ else
     TEST_OPT = $(OPT)
 endif
 
-RISCV_CFLAGS = -static -nostdlib -nostartfiles -march=$(RISCV_ARCH) -mabi=ilp32 -Wall \
+RISCV_CFLAGS = -static -nostdlib -nostartfiles -mabi=ilp32 -Wall \
 		-Wextra -std=c11 -pedantic -g -Werror=implicit-function-declaration \
 		$(RISCV_CFLAGS_EXTRA)
-RISCV_C_ONLY_FLAGS = $(TEST_OPT) -fno-inline
+# -march is per-source-language: hand-written .S tests assemble with
+# RISCV_ARCH (rv32im, so the class mul tests can encode MUL), while C is
+# compiled for RISCV_ARCH_C (rv32i) so the compiler never emits M-extension
+# instructions that neither core decodes. See config.mk.
+RISCV_C_ONLY_FLAGS = -march=$(RISCV_ARCH_C) $(TEST_OPT) -fno-inline
+RISCV_AS_ONLY_FLAGS = -march=$(RISCV_ARCH)
+
+# Headers living alongside the test, as build prerequisites (see the .elf
+# rule). Directory-granular rather than per-#include, which is enough here
+# and needs no depfile machinery.
+TEST_HEADERS = $(wildcard $(dir $(TEST))*.h)
 RISCV_AS_LDFLAGS = -Wl,-e$(RISCV_ENTRY_POINT)
 RISCV_LDFLAGS = -Wl,-T$(RISCV_LINKER_SCRIPT) -lgcc
 
@@ -182,11 +193,15 @@ $(TEST_NAME).kdata.$(BINARY_EXTENSION): $(TEST_EXECUTABLE)
 %.$(ELF_EXTENSION): %.S $(RISCV_LINKER_SCRIPT) | $(OUTPUT) \
 		assemble-check-compiler assemble-check-test
 	@printf "Assembling test $u$<$n into binary files...\n"
-	@$(RISCV_CC) $(RISCV_CFLAGS) $< $(RISCV_LDFLAGS) $(RISCV_AS_LDFLAGS) -o $@ \
+	@$(RISCV_CC) $(RISCV_CFLAGS) $(RISCV_AS_ONLY_FLAGS) $< $(RISCV_LDFLAGS) \
+			$(RISCV_AS_LDFLAGS) -o $@ \
 			|& tee $(ASSEMBLE_LOG)
 
-%.$(ELF_EXTENSION): $(RISCV_STARTUP_FILE) %.c $(RISCV_LINKER_SCRIPT) | \
-		$(OUTPUT) assemble-check-compiler assemble-check-test
+# The trailing $(TEST_HEADERS) keeps the committed .elf/.bin from going stale
+# when a header next to the test changes (tests/perf/*.c pull their data sets
+# in that way). It stays out of $(wordlist 1,2,$^), which selects crt0.S + .c.
+%.$(ELF_EXTENSION): $(RISCV_STARTUP_FILE) %.c $(RISCV_LINKER_SCRIPT) \
+		$(TEST_HEADERS) | $(OUTPUT) assemble-check-compiler assemble-check-test
 	@printf "Assembling test $u$(word 2,$^)$n into binary files ($(TEST_OPT))...\n"
 	@$(RISCV_CC) $(RISCV_CFLAGS) $(RISCV_C_ONLY_FLAGS) $(wordlist 1,2,$^) \
 			$(RISCV_LDFLAGS) -o $@ |& tee $(ASSEMBLE_LOG)

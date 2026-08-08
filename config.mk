@@ -30,12 +30,22 @@ CORE ?= lightning
 # Leave RISCV_PREFIX empty to auto-detect from the candidates below (first
 # one found in PATH wins). Set it explicitly to pin a toolchain, e.g.:
 #     RISCV_PREFIX = riscv32-unknown-linux-gnu-
-# All tests build with -march=$(RISCV_ARCH) -mabi=ilp32 regardless of the
-# prefix. The class mul tests (multest, dependMul*) need the M extension,
-# hence rv32im; set RISCV_ARCH=rv32i to mimic a strict base-ISA build.
+# All tests build with -mabi=ilp32 regardless of the prefix.
+#
+# -march differs by source language, and the split matters:
+#   RISCV_ARCH   (.S tests) — rv32im, purely so the assembler can encode the
+#                class mul tests (multest, dependMul*). Nothing decodes M, so
+#                those 3 are expected failures; see CLAUDE.md "Ground truth".
+#   RISCV_ARCH_C (.c tests) — rv32i. GCC given rv32im happily emits MUL/DIV
+#                for ordinary C, which no core here executes, and it also
+#                changes the caller-saved register residue that the committed
+#                tests/c and tests/perf .reg oracles encode. Both effects show
+#                up as "wrong results" on a perfectly good core. Keep this
+#                rv32i unless an M implementation lands.
 # ------------------------------------------------------------------------
 RISCV_PREFIX ?=
 RISCV_ARCH ?= rv32im
+RISCV_ARCH_C ?= rv32i
 RISCV_TOOLCHAIN_CANDIDATES = riscv64-unknown-elf- riscv32-unknown-elf- \
 		riscv32-unknown-linux-gnu- riscv64-unknown-linux-gnu-
 
