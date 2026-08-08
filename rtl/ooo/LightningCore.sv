@@ -272,6 +272,36 @@ module LightningCore #(
     //     $display("mem_issue_pkts[0].core_req_ctrl_signals: %b", mem_issue_pkts[0].core_req_ctrl_signals);
     // end
 
+`ifdef LTG_DBG_MEM
+    /* TEMPORARY debug probe (stale-D-response investigation). Delete me. */
+    always_ff @(posedge clock) begin: dbg_mem_probe
+        if (reset_n) begin
+            if ((core_req_re_d || core_req_we_d) && core_rsp_ready_d)
+                $display("DBGREQ %0t %s id=%0d/c%0d addr=%08h",
+                         $time, core_req_we_d ? "ST" : "LD",
+                         core_req_id_d.id_index, core_req_id_d.id_color,
+                         {core_req_addr_d, 2'b00});
+            if (core_rsp_data_valid_d)
+                $display("DBGRSP %0t id=%0d/c%0d data=%08h rspRD=%0d rspWR=%0d || entry: v=%0d col=%0d RD=%0d WR=%0d addrRdy=%0d disp=%0d exec=%0d pc=%08h insn=%08h",
+                         $time, core_rsp_id_d.id_index, core_rsp_id_d.id_color,
+                         core_rsp_data_d,
+                         core_rsp_ctrl_signals_d.memRead,
+                         core_rsp_ctrl_signals_d.memWrite,
+                         dris_entries[core_rsp_id_d.id_index].entry_state.valid,
+                         dris_entries[core_rsp_id_d.id_index].id.id_color,
+                         dris_entries[core_rsp_id_d.id_index].ctrl_signals.memRead,
+                         dris_entries[core_rsp_id_d.id_index].ctrl_signals.memWrite,
+                         dris_entries[core_rsp_id_d.id_index].entry_state.mem_addr_ready,
+                         dris_entries[core_rsp_id_d.id_index].entry_state.dispatched,
+                         dris_entries[core_rsp_id_d.id_index].entry_state.executed,
+                         dris_entries[core_rsp_id_d.id_index].pc,
+                         dris_entries[core_rsp_id_d.id_index].debug_instr);
+            if (|flush_vector)
+                $display("DBGFLUSH %0t mask=%08h", $time, flush_vector);
+        end
+    end: dbg_mem_probe
+`endif
+
     /* =================================================================
      * D-cache port drive: MEM_ISSUE_WAYS issue packets -> 1 request.
      *

@@ -114,13 +114,10 @@ module DRIS
             end: fetch_writes
 
             for (int i = 0; i < WRITEBACK_PORTS; i++) begin: writeback_writes
-                // the target must still be valid: with the registered
-                // execute stage, a wrong-path instruction can write back
-                // the cycle after its entry was flushed — if that index
-                // were already reallocated, an unguarded write would mark
-                // the newborn entry executed with garbage
-                if (writeback_pkts[i].valid_W &&
-                    dris_entries[writeback_pkts[i].id_W.id_index].entry_state.valid) begin
+                // the target must still be the instruction that issued this
+                // writeback — see wb_accepted() for why an index match is
+                // nowhere near enough
+                if (wb_accepted(i)) begin
 
                     /* No debug write-back of pc/instr here: intake already
                      * stored both (and neither field exists on the entry
@@ -250,21 +247,79 @@ module DRIS
     logic dep1_retiring_now [FETCH_WAYS-1:0];
     logic dep2_retiring_now [FETCH_WAYS-1:0];
 
+    /* A writeback may only land on the entry that actually issued it, and a
+     * matching id_index is nowhere near enough to establish that:
+     *
+     *  - `valid`: the entry may have retired or been flushed and be empty.
+     *  - `id_color`: the index may have been recycled a full lap later.
+     *  - `!fetch_write_mask`: the index may be taking a newborn from fetch
+     *    *this* cycle. fetch_writes runs earlier in the same always_ff, so
+     *    an unguarded writeback NBA lands on top of the newborn — this is
+     *    the exec-way half of the hazard, reachable one cycle after a flush
+     *    because the registered execute stage still has the wrong-path
+     *    instruction in it.
+     *  - and on the load-return port, the entry must actually *be* a load
+     *    with a D-cache request outstanding. A mispredict rewinds fetch_ptr
+     *    to the branch's id + 1 (InstructionIssueUnit `fetch_ptr_reg`) —
+     *    same index *and* same color — so a load flushed while its request
+     *    is in flight has its slot reallocated almost immediately, and the
+     *    response comes back tagged for a completely unrelated instruction.
+     *    If that instruction is a store whose address isn't computed yet,
+     *    the branch below reads the response as the store's AGU pass: it
+     *    parks the load's *data* as the store's address and sets
+     *    mem_addr_ready, and the store then writes to that bogus address
+     *    while its real address calculation never runs.
+     *
+     * NOTE: this closes the case where the recycled slot holds something
+     * that cannot legitimately take a load return. It does not close the
+     * case where the slot is recycled into *another load* that has itself
+     * issued — index, color and entry state all match there, and the two
+     * responses are indistinguishable. That needs the request to be tracked
+     * from issue to return (see docs/memorable-bugs.md).
+     */
+    function automatic logic wb_accepted(int p);
+        automatic logic [DRIS_ID_WIDTH-1:0] idx = writeback_pkts[p].id_W.id_index;
+
+        if (!writeback_pkts[p].valid_W)                return 1'b0;
+        if (!dris_entries[idx].entry_state.valid)      return 1'b0;
+        if (fetch_write_mask[idx])                     return 1'b0;
+        if (dris_entries[idx].id.id_color != writeback_pkts[p].id_W.id_color)
+                                                       return 1'b0;
+
+        // ports [EXEC_UNITS, WRITEBACK_PORTS) are the memory-read returns
+        if (p >= EXEC_UNITS)
+            return dris_entries[idx].ctrl_signals.memRead       &&
+                   dris_entries[idx].entry_state.mem_addr_ready &&
+                   dris_entries[idx].entry_state.dispatched     &&
+                   !dris_entries[idx].entry_state.executed;
+
+        return 1'b1;
+    endfunction
+
+    // True when port p's writeback is the address phase of a load/store:
+    // it parks an address and publishes no result. Must match the branch
+    // taken in writeback_writes.
+    function automatic logic wb_is_agu_pass(int p);
+        automatic logic [DRIS_ID_WIDTH-1:0] idx = writeback_pkts[p].id_W.id_index;
+        return (writeback_pkts[p].ctrl_signals_W.memRead ||
+                writeback_pkts[p].ctrl_signals_W.memWrite) &&
+               ~dris_entries[idx].entry_state.mem_addr_ready;
+    endfunction
+
     // Same-cycle intake bypass: a dependent arriving from fetch in the exact
     // cycle its producer's completing writeback fires must not lock — the
     // unlock broadcast scans the *old* locker state, so it can't see the
     // newborn entry and the lock would never clear. An AGU-pass writeback
     // (load/store address, mem_addr_ready not yet set) doesn't count: it
     // publishes no result, so the dependent still needs to lock and wait
-    // for the data writeback.
+    // for the data writeback. A writeback the DRIS is going to *drop*
+    // doesn't count either, or the dependent skips a lock that never fires.
     function automatic logic completing_wb(dris_id_t dep);
         for (int p = 0; p < WRITEBACK_PORTS; p++) begin
-            if (writeback_pkts[p].valid_W &&
+            if (wb_accepted(p) &&
                 writeback_pkts[p].id_W.id_index == dep.id_index &&
                 writeback_pkts[p].id_W.id_color == dep.id_color &&
-                !((writeback_pkts[p].ctrl_signals_W.memRead ||
-                   writeback_pkts[p].ctrl_signals_W.memWrite) &&
-                  ~dris_entries[dep.id_index].entry_state.mem_addr_ready)) begin
+                !wb_is_agu_pass(p)) begin
                 return 1'b1;
             end
         end
