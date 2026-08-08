@@ -28,3 +28,6 @@ DVEfiles/
 *.swp
 *~
 .DS_Store
+
+# afs files
+.__afs*
