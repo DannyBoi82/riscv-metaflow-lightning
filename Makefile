@@ -283,7 +283,7 @@ endif
 VCS = vcs
 VCS_FLAGS_BASE = -sverilog -q -j $(THREADS) +warn=all \
 		+lint=PCWM,IWU,TFIPC,ONGS,VNGS,IRIMW,UI,CAWM-L +error+20 \
-		-xzcheck nofalseneg $(SIM_DEFINES) $(VCS_EXTRA)
+		-xzcheck nofalseneg $(SIM_DEFINES) $(VCS_EXTRA) #get rid of -xzcheck nofalseneg to silence the compiler on long tests
 VCS_DEBUG_FLAGS = -debug_acc+all -debug_region+cell+encrypt +memcbk
 VCS_FLAGS = $(VCS_FLAGS_BASE)
 ifeq ($(WAVES),1)

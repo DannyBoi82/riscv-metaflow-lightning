@@ -449,7 +449,7 @@ module riscv_decode
             end
 
             default: begin
-                `display(rst_l, "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
+                //`display(rst_l, "Encountered unknown/unimplemented opcode 0x%02x.", opcode);
                 ctrl_signals.illegal_instr = 1'b1;
             end
         endcase
