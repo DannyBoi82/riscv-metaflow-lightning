@@ -117,6 +117,24 @@ package DRIS_defs;
     } dris_entry_t;
     localparam int DRIS_ENTRY_WIDTH = $bits(dris_entry_t);
 
+    typedef dris_entry_t EMPTY_DRIS_ENTRY = '{
+        `ifdef DEBUG
+            debug_instr: '0,
+            debug_mem_addr: '0,
+        `endif
+        pc: '0,
+        rd: '0,
+        rs1: '0,
+        rs2: '0,
+        entry_state: '{valid: 1'b0, dispatched: 1'b0, executed: 1'b0, trap: 1'b0, mem_addr_ready: 1'b0},
+        id: '{id_valid: 1'b0, id_color: 1'b0, id_index: {DRIS_ID_WIDTH{1'b1}}},
+        locker_1: '{locked: 1'b0, locker_color: 1'b0, locker_valid: 1'b0, locker_id: {DRIS_ID_WIDTH{1'b1}}},
+        locker_2: '{locked: 1'b0, locker_color: 1'b0, locker_valid: 1'b0, locker_id: {DRIS_ID_WIDTH{1'b1}}},
+        result: '{result_data: '0, result_valid: 1'b0},
+        ctrl_signals: CTRL_SIGNALS_NOOP,
+        imm: '0
+    };
+
     typedef struct packed {
         `ifdef DEBUG
             logic [XLEN-1:0] debug_instr_I;
