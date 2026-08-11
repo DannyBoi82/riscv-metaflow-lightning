@@ -117,7 +117,9 @@ package DRIS_defs;
     } dris_entry_t;
     localparam int DRIS_ENTRY_WIDTH = $bits(dris_entry_t);
 
-    typedef dris_entry_t EMPTY_DRIS_ENTRY = '{
+    // A cleared DRIS entry. `typedef` cannot carry an initializer — this is
+    // a named constant, not a type — so it has to be a localparam.
+    localparam dris_entry_t EMPTY_DRIS_ENTRY = '{
         `ifdef DEBUG
             debug_instr: '0,
             debug_mem_addr: '0,

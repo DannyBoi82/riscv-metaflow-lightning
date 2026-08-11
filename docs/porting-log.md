@@ -591,3 +591,139 @@ Two corrections to earlier entries in this log:
   way (1 and 4 M-instructions); they build clean now. The other 13 C tests
   were never affected — GCC found no reason to emit MUL for them, which is
   exactly why this went unnoticed for a month.
+
+## 2026-08-11: performance counters for Lightning (`LTG_PERF`)
+
+Lightning had no PERF block; the in-order core's (`rtl/core/riscv_core.sv`)
+was the only one. Ported the architecture-independent counters over and
+added the OoO-specific ones, per `docs/perf-counters-plan.md`. Everything
+lives at the bottom of `rtl/ooo/LightningCore.sv`; see `docs/architecture.md`
+for what it reports. Three things worth writing down.
+
+### The switch had to be `LTG_PERF`, not `PERF`
+
+The plan said to mirror the in-order core's `` `define PERF ``. That does
+not work here, and the failure is silent. Macros carry across files on the
+compiler command line, `RTL_DIR_ORDER` puts `rtl/core` before `rtl/ooo`, and
+`riscv_core.sv` is compiled in **every** build regardless of `CORE` (only
+the `riscv_core_interface*` files are filtered out). So `riscv_core.sv`'s
+`` `define PERF `` at line 36 is already in scope by the time
+`LightningCore.sv` is preprocessed.
+
+Measured, not guessed: with a `` `define PERF `` in `LightningCore.sv`,
+commenting it out left the counters compiled in and printing. Commenting out
+`riscv_core.sv`'s as well was what turned them off. That is the same
+macro-leak trap `1DRIS_defs.sv` documents for `DEBUG`, and it would have
+meant "comment out before synthesis" quietly not working.
+
+Renamed to `` `LTG_PERF `` (LTG_* is the convention for Lightning knobs,
+`ifndef`-guarded, on by default). Verified independent afterwards: with
+`riscv_core.sv`'s `PERF` left defined, commenting out `` `define LTG_PERF ``
+alone drops the Lightning block and the build still passes. `cache_sweep.py`
+now passes `+define+PERF +define+LTG_PERF` so a sweep gets a printout
+whichever core it is pointed at.
+
+### Mispredicts and mispredict redirects are not the same number
+
+The plan's sanity check 4 expected `branches_mispredicted` to equal the
+count of `mispredict_valid` pulses. It doesn't, and the difference is real
+hardware behavior, not a counting bug: `BranchShelf` step (3) clears the
+oldest WRONG entry *and everything younger than it*, and step (6) wipes the
+shelf on a trap — both run in the same `always_comb` pass that step (2)
+writes the resolve verdict in. A branch that resolves WRONG in the cycle an
+older branch's flush reaches it is itself wrong-path, so its WRONG status is
+overwritten before anyone sees it and it never redirects.
+
+Rather than leave the two numbers unreconciled, the shelf exports a third
+event, `perf_resolve_wrong_squashed` (`perf_resolve_wrong` whose verdict is
+gone from the final `next_shelf`). The invariant is
+
+    mispredicted - squashed == mispredict redirects
+
+which holds on all 53 asm tests (`beqtest` is the one that exercises it:
+8 - 2 == 6). Sanity check 4 in the plan should be read as this, not as
+equality.
+
+### Sanity check 3 (`hits + misses == accesses`) does not hold, on either core
+
+`num_i_cache`/`num_d_cache` are not probe counts. They're derived from
+`choose_d_cache`, which is main-memory port arbitration, so "D$ accesses" is
+cycles the D-side owned the memory bus and "I$ accesses" is literally every
+other cycle, idle ones included (`memtest2`: I$ accesses 216 of 220 cycles,
+against 25 I$ misses). Inherited semantics from the in-order core, so the
+`$display` string is kept for shared parsing, with a note line printed under
+it. `hits`/`misses` are the real per-cache numbers. Also: `I$ hits: 0` on a
+straight-line test is correct, not a broken signal — a fetch group is a
+whole cache block here, so code with no reuse never re-probes a block
+(`depend`: 0 hits / 80 misses / 15 evictions for 316 straight-line
+instructions). Loopy tests show hits (`brtest2`: 13 hits / 21 misses).
+
+### Also fixed here
+
+`rtl/ooo/1DRIS_defs.sv:120` — HEAD (`ad1277d`) did not compile under VCS
+T-2022.06 at all: `typedef dris_entry_t EMPTY_DRIS_ENTRY = '{...}` is a
+constant declared with `typedef`, which cannot take an initializer. Changed
+to `localparam dris_entry_t`. It is unused today (one commented-out
+reference in `NewDris.sv`), so this is purely the syntax fix.
+
+### Verification
+
+- 53/53 `tests/asm` (all but the 3 expected mul failures): `instructions
+  retired` equals `make verify-trace`'s commit count **exactly**, on every
+  one. That is the counter cross-check that matters — it validates the
+  retire accounting, the halting-ecall +1, and the DRIS-indexed
+  `retire_vector` scatter in a single number.
+- `make regress SIM=vcs` unchanged on both cores: 3 mul failures, nothing
+  else. PERF is observation-only.
+- Non-PERF build (the synthesis configuration) compiles and passes.
+- Watchdog fallback: `depend` with `+define+LTG_MAX_SIM_CYCLES=200` prints
+  once, flagged `!! run ended without a halting ecall`. A normal halting run
+  also prints exactly once — the `perf_printed` flag is blocking-assigned so
+  the `final` block sees it before `$finish` (same reasoning as
+  `commit_verifier`'s `dumped`; NBA updates land after `$finish`).
+
+### tests/perf baseline, CORE=lightning, VCS, defaults (32-entry DRIS, 4 fetch/4 exec ways, 8-entry shelf)
+
+| | dhrystone | fft | spmv | kosarajus |
+|---|---|---|---|---|
+| verify | Correct | Correct | Correct | **TIMEOUT** |
+| cycles | 9,828,242 | 7,566,159 | 15,452,918 | 20,000,000 (cap) |
+| retired | 4,889,053 | 3,885,328 | 7,055,601 | 112,300 |
+| fetched | 5,613,504 | 5,234,499 | 9,880,334 | 112,456 |
+| IPC | 0.497 | 0.514 | 0.457 | 0.006 |
+| intake stall (DRIS full) | 3,575,156 | 11,011 | 8,299,935 | 160,159 |
+| intake stall (shelf full) | 0 | 0 | 1,640,554 | 0 |
+| mispredict redirects | 130,053 | 349,331 | 315,076 | 12 |
+| branches resolved / mispred | 658,108 / 140,062 | 1,375,144 / 375,417 | 1,628,119 / 346,621 | 8,035 / 12 |
+| DRIS occupancy avg (of 32) | 16.9 | 2.9 | 22.8 | 0.3 |
+| shelf occupancy avg (of 8) | 1.6 | 0.9 | 2.4 | 1.0 |
+| int slots/cycle (of 4) | 0.551 | 0.676 | 0.606 | 0.006 |
+| memory issues/cycle (of 1) | 0.277 | 0.023 | 0.154 | 0.002 |
+
+What the numbers say, for whoever tunes this next:
+
+- **Execute width is not the bottleneck anywhere.** 0.55-0.68 integer slots
+  used per cycle out of 4 ways (14-17%). Widening EXECUTE_WAYS would buy
+  nothing; the starvation is upstream.
+- **DRIS capacity is the bottleneck on dhrystone and spmv** — intake blocked
+  36% and 54% of all cycles respectively, entirely on `dris_room`. spmv also
+  sits at 22.8/32 average occupancy. That is the knob to sweep next
+  (`LTG_DRIS_ENTRIES`), and it matches the HEAD~1 commit message's finding
+  that going to 32 entries bought ~20% over the in-order core.
+- **fft is prediction-bound instead**: DRIS-full is noise (11k cycles) but it
+  takes 349k mispredict redirects at a 27% mispredict rate.
+- **spmv is the only benchmark where the branch shelf ever blocks intake**
+  (1.6M cycles), so `LTG_BRANCH_SHELF_ENTRIES` is worth a look there and
+  nowhere else.
+- Note `retire_drought` is high everywhere (69% of cycles on dhrystone) while
+  DRIS occupancy is mid-range — retire bandwidth is not the constraint;
+  entries are sitting un-executed.
+
+**kosarajus hangs** (hit the 20M watchdog; the counters come from the
+`final`-block fallback). Pre-existing, not caused by the counters — the same
+run on HEAD + only the `1DRIS_defs.sv` syntax fix also times out. The
+counters do characterize it: the DRIS is 99% *empty* (avg 0.317 valid
+entries), integer slots 0.1% used, only 112k instructions retired in 20M
+cycles — and 2,199,096 I$ misses against 40,160 hits with 618,471 evictions.
+That is fetch starvation / I-cache thrashing, not an OoO-engine deadlock,
+which is a different place to start looking than `fibm.c`'s hang.

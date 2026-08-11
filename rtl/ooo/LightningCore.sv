@@ -2,6 +2,27 @@
 
 `include "riscv_commit.vh"
 
+/* Performance counters are simulation-only: comment this out before
+ * synthesis, same as the in-order core's `PERF (rtl/core/riscv_core.sv
+ * line 36). Only the counter block at the bottom of this file is gated by
+ * it — the cache-event input ports and the IIU's perf outputs are always
+ * present, so the port list has the same shape in every build.
+ *
+ * Deliberately NOT named `PERF. Macros carry across files on the compiler
+ * command line, rtl/core is compiled before rtl/ooo (Makefile
+ * RTL_DIR_ORDER), and riscv_core.sv is in every build regardless of CORE —
+ * so riscv_core.sv's `define PERF is already in scope here. Sharing the
+ * name means commenting this line out does nothing until you also comment
+ * out the in-order core's, which is exactly the trap `1DRIS_defs.sv warns
+ * about for DEBUG. LTG_PERF is Lightning's own switch, per the LTG_*
+ * convention in rtl/include/config.vh.
+ *
+ * `ifndef-guarded so a `PARAMS='+define+LTG_PERF'` on the command line
+ * (scripts/cache_sweep.py does this) isn't a redefinition. */
+`ifndef LTG_PERF
+`define LTG_PERF
+`endif
+
 import DRIS_defs::*;
 import RISCV_ISA::*;
 import RISCV_UArch::*;  // Import microarchitecture parameters and definitions
@@ -104,7 +125,22 @@ module LightningCore #(
     input  logic                      core_rsp_ready_d,
     input  logic                      core_rsp_excpt_d,
     input  dris_id_t                  core_rsp_id_d,
-    input  ctrl_signals_t              core_rsp_ctrl_signals_d
+    input  ctrl_signals_t              core_rsp_ctrl_signals_d,
+
+    /* ============================================================
+     * Cache-event inputs for the performance counters.
+     *
+     * These are events the cache controllers raise and the core has no
+     * other view of; riscv_core_interface already has every one of them
+     * as a local wire and just fans them in here. They are always-present
+     * ports, exactly as on the in-order core (rtl/core/riscv_core.sv):
+     * only the counters that consume them are `ifdef LTG_PERF, so the
+     * list has the same shape in every build.
+     * ============================================================ */
+    input  logic                      is_eviction_i, read_hit_i, read_miss_i,
+    input  logic                      is_eviction_d, read_hit_d, read_miss_d,
+    input  logic                      choose_d_cache,
+    input  logic                      i_d_conflict
 );
 
     localparam int WRITEBACK_PORTS = EXEC_UNITS + DRIS_defs::MEMORY_READ_PORTS;
@@ -162,6 +198,13 @@ module LightningCore #(
     dris_id_t                    oldest_branch_id;
     logic                        branch_fence_valid;
     logic [DRIS_NUM_ENTRIES-1:0] flush_mask;
+
+    // IIU perf observation (always driven; consumed only under `LTG_PERF)
+    logic [$clog2(DRIS_defs::BRANCH_SHELF_ENTRIES+1)-1:0] perf_shelf_occupancy;
+    logic perf_branch_resolved, perf_branch_mispredicted, perf_mispredict_valid;
+    logic perf_branch_mispredict_squashed;
+    logic perf_intake_stall, perf_stall_dris_full, perf_stall_shelf_full;
+    logic perf_issue_fire;
 
     // Scheduler <-> register file read ports
     logic [EXEC_UNITS-1:0]    sched_read_rf;    // informational; reads are always live
@@ -221,7 +264,16 @@ module LightningCore #(
         .core_rsp_addr       (core_rsp_addr),
         .core_rsp_data_valid (core_rsp_data_valid),
         .core_rsp_ready      (core_rsp_ready),
-        .core_rsp_excpt      (core_rsp_excpt)
+        .core_rsp_excpt      (core_rsp_excpt),
+        .perf_shelf_occupancy     (perf_shelf_occupancy),
+        .perf_branch_resolved     (perf_branch_resolved),
+        .perf_branch_mispredicted (perf_branch_mispredicted),
+        .perf_branch_mispredict_squashed (perf_branch_mispredict_squashed),
+        .perf_mispredict_valid    (perf_mispredict_valid),
+        .perf_intake_stall        (perf_intake_stall),
+        .perf_stall_dris_full     (perf_stall_dris_full),
+        .perf_stall_shelf_full    (perf_stall_shelf_full),
+        .perf_issue_fire          (perf_issue_fire)
     );
 
     /* =================================================================
@@ -666,5 +718,403 @@ module LightningCore #(
 `endif
         end
     end : commit_pkt_padding
+
+    /* =================================================================
+     * PERFORMANCE COUNTERS (`LTG_PERF only)
+     *
+     * Same conventions as the in-order core's block (rtl/core/riscv_core.sv,
+     * "PERFORMANCE COUNTERS"): plain `int` counters in one always_ff, reset
+     * with the core, frozen once `halted`, pretty-printed by a task on the
+     * halt edge. Everything here is observation only — no signal below is
+     * read by the design.
+     *
+     * Two things differ from the in-order block, both because this is an
+     * out-of-order machine:
+     *
+     *  - The in-order stall breakdown (FD/EMW, stall run-length histogram)
+     *    has no analogue. A "stalled" OoO core shows up instead as low
+     *    utilization: few retires per cycle, few issue slots used. Those
+     *    are the Part 2 counters below, plus the explicit front-end
+     *    blocking counters (DRIS full / shelf full).
+     *
+     *  - Per-cycle events are counts, not booleans: several instructions
+     *    can retire, issue or be fetched in one cycle. Each such counter
+     *    is accumulated from a combinational popcount computed just below,
+     *    because an NBA inside a for-loop would keep only the last write.
+     *
+     * Averages are accumulate-now, divide-at-print: no `real` arithmetic
+     * outside print_perf_metrics().
+     * ================================================================= */
+`ifdef LTG_PERF
+    // ----- Per-cycle observation vectors -------------------------------
+    // $countones needs a packed vector; dris_entries / issue_pkts_reg /
+    // mem_issue_pkts are unpacked arrays of structs, so flatten first.
+    logic [DRIS_NUM_ENTRIES-1:0] perf_dris_valid;
+    logic [FETCH_WORDS-1:0]      perf_fetch_valid;
+    logic [EXEC_UNITS-1:0]       perf_int_busy;
+    logic [MEM_ISSUE_WAYS-1:0]   perf_mem_busy;
+
+    always_comb begin : perf_vectors
+        for (int i = 0; i < DRIS_NUM_ENTRIES; i++)
+            perf_dris_valid[i] = dris_entries[i].entry_state.valid;
+
+        // Fetch counts DRIS intakes, so it includes wrong-path instructions
+        // by construction — that is the point of the metric: the gap between
+        // this and instructions-retired is the speculation tax.
+        for (int w = 0; w < FETCH_WORDS; w++)
+            perf_fetch_valid[w] = dris_intake_pkts[w].valid_R;
+
+        /* issue_pkts_reg, not issue_pkts: the registered copy is what the
+         * exec ways actually chew on this cycle, so an issue group still
+         * completing across a flush counts as busy (it really is occupying
+         * the slot). Note these slots include the AGU pass of a load/store —
+         * memory is two-phase here, so a memory op occupies an integer slot
+         * once for its address and then a memory way for the access. */
+        for (int e = 0; e < EXEC_UNITS; e++)
+            perf_int_busy[e] = issue_pkts_reg[e].ready_I;
+
+        for (int w = 0; w < MEM_ISSUE_WAYS; w++)
+            perf_mem_busy[w] = mem_issue_pkts[w].core_req_re |
+                               mem_issue_pkts[w].core_req_we;
+    end : perf_vectors
+
+    // ----- Per-cycle counts --------------------------------------------
+    int perf_retired_now, perf_fetched_now, perf_dris_occ;
+    int perf_int_used_now, perf_mem_used_now;
+    // Instruction mix, counted at *retirement* (not at issue, where the
+    // two-phase memory path would double-count) over the whole DRIS,
+    // because retire_vector is entry-indexed.
+    int perf_ret_alu, perf_ret_load, perf_ret_store, perf_ret_ct;
+
+    always_comb begin : perf_counts
+        perf_retired_now  = $countones(retire_vector);
+        perf_fetched_now  = $countones(perf_fetch_valid);
+        perf_dris_occ     = $countones(perf_dris_valid);
+        perf_int_used_now = $countones(perf_int_busy);
+        perf_mem_used_now = $countones(perf_mem_busy);
+
+        perf_ret_alu   = 0;
+        perf_ret_load  = 0;
+        perf_ret_store = 0;
+        perf_ret_ct    = 0;
+        for (int i = 0; i < DRIS_NUM_ENTRIES; i++) begin
+            if (retire_vector[i]) begin
+                if (dris_entries[i].ctrl_signals.pc_source != PC_plus4)
+                    perf_ret_ct++;
+                else if (dris_entries[i].ctrl_signals.memRead)
+                    perf_ret_load++;
+                else if (dris_entries[i].ctrl_signals.memWrite)
+                    perf_ret_store++;
+                else
+                    perf_ret_alu++;
+            end
+        end
+    end : perf_counts
+
+    /* Counters that accumulate a per-cycle *count* rather than a 0/1 event
+     * are `longint`: their ceiling is cycles x capacity, and capacity is a
+     * swept knob. At the defaults (32 DRIS entries, 20M-cycle watchdog)
+     * dris_occ_total tops out around 640M, but LTG_DRIS_ENTRIES=128 would
+     * push it past a signed 32-bit int and silently wrap. Plain cycle/event
+     * counters stay `int` — they can't exceed elapsed_cycles.
+     * Both simulators handle longint and %0d on it. */
+
+    // ----- Cycle / instruction counts -----------------------------------
+    int     elapsed_cycles;
+    longint retired_total;      // $countones(retire_vector) summed
+    longint fetched_total;      // DRIS intakes summed (wrong path included)
+    int     fetch_groups;       // I$ responses accepted into the DRIS
+    int ALU_inst_num, Lx_inst_num, Sx_inst_num, CT_inst_num;
+
+    // ----- Front-end blocking / recovery --------------------------------
+    int intake_stall_cycles;    // a fetch group was held at the FIFO head
+    int stall_dris_full;        //   ...because the DRIS had no room
+    int stall_shelf_full;       //   ...because the branch shelf had none
+    int retire_drought_cycles;  // nothing retired at all
+    int flush_cycles;           // a flush mask was live
+    int mispredict_pulses;      // mispredict redirects taken
+
+    // ----- Branches (resolved at the shelf, not at retirement) ----------
+    int branches_resolved, branches_mispredicted, branches_mispredict_squashed;
+
+    // ----- Cache counters (from the always-present wrapper ports) -------
+    int eviction_i, hits_i, miss_i;
+    int eviction_d, hits_d, miss_d;
+    int num_i_cache, num_d_cache, num_conflicts;
+
+    // ----- OoO utilization ----------------------------------------------
+    int     retire_hist[RETIRES_PER_CYCLE+1];  // retires-per-cycle distribution
+    int     int_issue_hist[EXEC_UNITS+1];      // integer slots used per cycle
+    longint dris_occ_total;
+    int     dris_occ_max, dris_full_cycles;
+    longint shelf_occ_total;
+    int     shelf_occ_max, shelf_full_cycles;
+    longint int_slots_used, mem_slots_used;
+
+    // Set once the printout has been emitted, so the `final` fallback below
+    // doesn't print a second time over a normal halting run. Blocking-
+    // assigned and cleared in reset for the same reasons as
+    // commit_verifier.sv's `dumped`: the `final` block has to observe it
+    // without waiting for an NBA update, and VCS counts a declaration
+    // initializer as a second driver.
+    logic perf_printed;
+
+    // --------------------------------------------------------------------
+    // Pretty-printer
+    //
+    // halt_reached distinguishes a normal end-of-run from the watchdog
+    // fallback, and decides whether the halting ecall counts as retired: it
+    // never reaches a retire slot (the SSC traps on it at the head instead),
+    // but the reference simulator does execute it, so counting it keeps
+    // `instructions retired` equal to the refsim count and to the commit
+    // trace's line count.
+    //
+    // Shared metrics keep the in-order core's exact `$display` strings so
+    // one set of scripts/cache_sweep.py PERF_PATTERNS parses both cores.
+    // --------------------------------------------------------------------
+    function automatic real perf_ratio(input longint num, input longint den);
+        return (den == 0) ? 0.0 : real'(num) / real'(den);
+    endfunction
+
+    task automatic print_perf_metrics(input logic halt_reached);
+        longint total_retired;
+        total_retired = retired_total + (halt_reached ? 64'd1 : 64'd0);
+
+        $display("\t\t PERFORMANCE METRICS (Lightning OoO):");
+        if (!halt_reached)
+            $display({"\t !! run ended without a halting ecall (watchdog or ",
+                      "early $finish); counters are the state at the cutoff"});
+
+        $display("\t total cycles:              %0d", elapsed_cycles);
+        $display("\t instructions retired:      %0d", total_retired);
+        $display("\t instructions fetched:      %0d", fetched_total);
+        $display("\t fetch groups accepted:     %0d", fetch_groups);
+        $display("\t IPC:                       %0.3f",
+                 perf_ratio(total_retired, elapsed_cycles));
+        $display("\t CPI:                       %0.3f",
+                 perf_ratio(elapsed_cycles, total_retired));
+        $display("\t speculation tax (fetched/retired): %0.3f",
+                 perf_ratio(fetched_total, total_retired));
+
+        $display("\t Front end:");
+        $display("\t  intake stall cycles:      %0d", intake_stall_cycles);
+        $display("\t   DRIS full:               %0d", stall_dris_full);
+        $display("\t   branch shelf full:       %0d", stall_shelf_full);
+        $display("\t  flush cycles:             %0d", flush_cycles);
+        $display("\t  mispredict redirects:     %0d", mispredict_pulses);
+        $display("\t  cycles with no retire:    %0d", retire_drought_cycles);
+
+        $display("\t Non-Control Flow Types (at retirement):");
+        $display("\t  ALU:    %0d", ALU_inst_num);
+        $display("\t  Loads:  %0d", Lx_inst_num);
+        $display("\t  Stores: %0d", Sx_inst_num);
+        $display("\t  Control transfers: %0d", CT_inst_num);
+
+        /* Three numbers, because they are three different things:
+         *   resolved     — branches/JALRs the shelf decided
+         *   mispredicted — of those, how many had guessed wrong
+         *   squashed     — of *those*, how many were themselves wrong-path
+         *                  (an older branch's flush reached them first), so
+         *                  they never caused a redirect
+         * "mispredict redirects" under Front end above is therefore
+         * mispredicted - squashed, give or take one still in flight when
+         * the run ends. */
+        $display("\t Branches (resolved at the shelf):");
+        $display("\t  resolved:      %0d", branches_resolved);
+        $display("\t  mispredicted:  %0d", branches_mispredicted);
+        $display("\t   of which squashed by an older flush: %0d",
+                 branches_mispredict_squashed);
+        $display("\t  mispredict rate: %0.3f",
+                 perf_ratio(branches_mispredicted, branches_resolved));
+
+        $display("\t Retires per cycle:");
+        $display("\t  avg: %0.3f  (max %0d/cycle)",
+                 perf_ratio(retired_total, elapsed_cycles), RETIRES_PER_CYCLE);
+        for (int i = 0; i <= RETIRES_PER_CYCLE; i++)
+            $display("\t    [%0d]: %0d", i, retire_hist[i]);
+
+        /* Occupancy here is the count of *valid* entries. The intake stall
+         * uses a different quantity — `occupancy = fetch_ptr - retire_ptr`
+         * against the incoming group_count — so intake blocks as soon as
+         * fewer than a group's worth of slots are free, well before all
+         * DRIS_NUM_ENTRIES are valid. "cycles full" below is therefore a
+         * strict subset of the "DRIS full" line under Front end, and that
+         * line is the one to act on. */
+        $display("\t DRIS utilization (of %0d entries, valid-entry count):",
+                 DRIS_NUM_ENTRIES);
+        $display("\t  avg: %0.3f  max: %0d  cycles at capacity: %0d",
+                 perf_ratio(dris_occ_total, elapsed_cycles),
+                 dris_occ_max, dris_full_cycles);
+        $display({"\t   (intake blocks before this — see \"DRIS full\" ",
+                  "under Front end for the actionable number)"});
+
+        $display("\t Branch shelf utilization (of %0d entries):",
+                 DRIS_defs::BRANCH_SHELF_ENTRIES);
+        $display("\t  avg: %0.3f  max: %0d  cycles full: %0d",
+                 perf_ratio(shelf_occ_total, elapsed_cycles),
+                 shelf_occ_max, shelf_full_cycles);
+
+        $display("\t Scheduler utilization:");
+        $display("\t  integer slots used/cycle: %0.3f of %0d (%0.1f%%)",
+                 perf_ratio(int_slots_used, elapsed_cycles), EXEC_UNITS,
+                 100.0 * perf_ratio(int_slots_used,
+                                    longint'(elapsed_cycles) * EXEC_UNITS));
+        $display({"\t   (includes AGU passes: a load/store occupies an ",
+                  "integer slot for its address before its memory pass)"});
+        for (int i = 0; i <= EXEC_UNITS; i++)
+            $display("\t    [%0d]: %0d", i, int_issue_hist[i]);
+        $display("\t  memory issues/cycle:      %0.3f of %0d",
+                 perf_ratio(mem_slots_used, elapsed_cycles), MEM_ISSUE_WAYS);
+
+        $display("\t Cache Counters:");
+        $display("\t  I$ evictions: %0d | hits: %0d | misses: %0d",
+                 eviction_i, hits_i, miss_i);
+        $display("\t  D$ evictions: %0d | hits: %0d | misses: %0d",
+                 eviction_d, hits_d, miss_d);
+        $display("\t  I$ accesses:  %0d | D$ accesses: %0d",
+                 num_i_cache, num_d_cache);
+        /* Same definition (and the same $display string) as the in-order
+         * core, which is why the wording is kept — but it is not a probe
+         * count and hits+misses will not add up to it. choose_d_cache is
+         * the main-memory port arbitration, so "D$ accesses" is cycles the
+         * D-side owned the memory bus and "I$ accesses" is every other
+         * cycle, idle ones included. Hits/misses above are the real per-
+         * cache probe counts. */
+        $display({"\t   (accesses = main-memory port arbitration cycles, ",
+                  "not cache probes; see hits/misses above)"});
+        $display("\t  I$/D$ conflicts: %0d", num_conflicts);
+    endtask
+
+    // --------------------------------------------------------------------
+    // Counter update logic
+    // --------------------------------------------------------------------
+    always_ff @(posedge clock, negedge reset_n) begin : perf_metrics
+        if (~reset_n) begin
+            elapsed_cycles        <= 0;
+            retired_total         <= 0;
+            fetched_total         <= 0;
+            fetch_groups          <= 0;
+            ALU_inst_num          <= 0;
+            Lx_inst_num           <= 0;
+            Sx_inst_num           <= 0;
+            CT_inst_num           <= 0;
+            intake_stall_cycles   <= 0;
+            stall_dris_full       <= 0;
+            stall_shelf_full      <= 0;
+            retire_drought_cycles <= 0;
+            flush_cycles          <= 0;
+            mispredict_pulses     <= 0;
+            branches_resolved     <= 0;
+            branches_mispredicted <= 0;
+            branches_mispredict_squashed <= 0;
+            eviction_i <= 0; hits_i <= 0; miss_i <= 0;
+            eviction_d <= 0; hits_d <= 0; miss_d <= 0;
+            num_i_cache <= 0; num_d_cache <= 0; num_conflicts <= 0;
+            dris_occ_total <= 0; dris_occ_max <= 0; dris_full_cycles <= 0;
+            shelf_occ_total <= 0; shelf_occ_max <= 0; shelf_full_cycles <= 0;
+            int_slots_used <= 0; mem_slots_used <= 0;
+            foreach (retire_hist[i])    retire_hist[i]    <= 0;
+            foreach (int_issue_hist[i]) int_issue_hist[i] <= 0;
+        end
+        // Freeze on halt exactly like the in-order block: the machine keeps
+        // clocking until the testbench's $finish, and those cycles would
+        // otherwise pollute every average.
+        else if (~halted) begin
+            elapsed_cycles <= elapsed_cycles + 1;
+
+            // ----- Part 1: throughput -----
+            retired_total <= retired_total + perf_retired_now;
+            fetched_total <= fetched_total + perf_fetched_now;
+            if (perf_issue_fire) fetch_groups <= fetch_groups + 1;
+
+            ALU_inst_num <= ALU_inst_num + perf_ret_alu;
+            Lx_inst_num  <= Lx_inst_num  + perf_ret_load;
+            Sx_inst_num  <= Sx_inst_num  + perf_ret_store;
+            CT_inst_num  <= CT_inst_num  + perf_ret_ct;
+
+            // ----- Part 1: front-end blocking / recovery -----
+            if (perf_intake_stall)     intake_stall_cycles <= intake_stall_cycles + 1;
+            if (perf_stall_dris_full)  stall_dris_full     <= stall_dris_full     + 1;
+            if (perf_stall_shelf_full) stall_shelf_full    <= stall_shelf_full    + 1;
+            if (perf_retired_now == 0) retire_drought_cycles <= retire_drought_cycles + 1;
+            /* flush_vector, not clear_valid: clear_valid is retire | flush,
+             * and a retirement is not a flush. */
+            if (|flush_vector)         flush_cycles      <= flush_cycles      + 1;
+            if (perf_mispredict_valid) mispredict_pulses <= mispredict_pulses + 1;
+
+            // ----- Part 1: branches -----
+            // Counted where the shelf decides them, not at retirement: a
+            // mispredicted branch's wrong-path youngers never retire, and
+            // the branch itself resolves cycles before it does.
+            if (perf_branch_resolved)     branches_resolved     <= branches_resolved     + 1;
+            if (perf_branch_mispredicted) branches_mispredicted <= branches_mispredicted + 1;
+            if (perf_branch_mispredict_squashed)
+                branches_mispredict_squashed <= branches_mispredict_squashed + 1;
+
+            // ----- Part 1: caches -----
+            if (is_eviction_i) eviction_i <= eviction_i + 1;
+            if (read_hit_i)    hits_i     <= hits_i     + 1;
+            if (read_miss_i)   miss_i     <= miss_i     + 1;
+            if (is_eviction_d) eviction_d <= eviction_d + 1;
+            if (read_hit_d)    hits_d     <= hits_d     + 1;
+            if (read_miss_d)   miss_d     <= miss_d     + 1;
+            if (choose_d_cache) num_d_cache <= num_d_cache + 1;
+            else                num_i_cache <= num_i_cache + 1;
+            if (i_d_conflict)   num_conflicts <= num_conflicts + 1;
+
+            // ----- Part 2a: retires per cycle -----
+            // The popcount is bounded by the SSC's retire window, but clamp
+            // the histogram index anyway — an out-of-range unpacked write
+            // would be silent.
+            retire_hist[(perf_retired_now > RETIRES_PER_CYCLE)
+                            ? RETIRES_PER_CYCLE : perf_retired_now]
+                <= retire_hist[(perf_retired_now > RETIRES_PER_CYCLE)
+                            ? RETIRES_PER_CYCLE : perf_retired_now] + 1;
+
+            // ----- Part 2b: DRIS utilization -----
+            dris_occ_total <= dris_occ_total + perf_dris_occ;
+            if (perf_dris_occ > dris_occ_max) dris_occ_max <= perf_dris_occ;
+            if (perf_dris_occ == DRIS_NUM_ENTRIES)
+                dris_full_cycles <= dris_full_cycles + 1;
+
+            // ----- Part 2c: branch shelf utilization -----
+            // "cycles full" is exactly the condition that makes shelf_room
+            // false and blocks intake.
+            shelf_occ_total <= shelf_occ_total + int'(perf_shelf_occupancy);
+            if (int'(perf_shelf_occupancy) > shelf_occ_max)
+                shelf_occ_max <= int'(perf_shelf_occupancy);
+            if (int'(perf_shelf_occupancy) == DRIS_defs::BRANCH_SHELF_ENTRIES)
+                shelf_full_cycles <= shelf_full_cycles + 1;
+
+            // ----- Part 2d: scheduler utilization -----
+            int_slots_used <= int_slots_used + perf_int_used_now;
+            mem_slots_used <= mem_slots_used + perf_mem_used_now;
+            int_issue_hist[perf_int_used_now]
+                <= int_issue_hist[perf_int_used_now] + 1;
+        end
+    end : perf_metrics
+
+    /* Print on the halt edge. `halted` is the trap-at-retire-head condition,
+     * and the testbench $finishes on the same edge after a #0, so this fires
+     * before the run ends. Counters read here are their pre-edge values,
+     * matching the in-order block. */
+    always_ff @(posedge clock, negedge reset_n) begin : perf_print
+        if (~reset_n) begin
+            perf_printed = 1'b0;
+        end
+        else if (halted && !perf_printed) begin
+            perf_printed = 1'b1;
+            print_perf_metrics(1'b1);
+        end
+    end : perf_print
+
+    /* Fallback for a run that ends any other way — in practice the watchdog
+     * killing a core that never reached its halting ecall, which is exactly
+     * the case tests/perf can hit. Same `dumped`-flag pattern as
+     * commit_verifier.sv, and it works in both simulators. */
+    final begin
+        if (!perf_printed) print_perf_metrics(1'b0);
+    end
+`endif /* LTG_PERF */
 
 endmodule : LightningCore

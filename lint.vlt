@@ -47,6 +47,14 @@ lint_off -rule BLKSEQ -file "*/tb/register_file.sv"
 // cross-process readers of upd.
 lint_off -rule BLKSEQ -file "*/tb/commit_verifier.sv"
 
+// rtl/ooo/LightningCore.sv: same pattern, same reason. The PERF block's
+// `perf_printed` flag is blocking-assigned inside always_ff so the `final`
+// fallback observes it without waiting for an NBA update — the testbench
+// $finishes in the inactive region, before the NBA region, so a nonblocking
+// assign would let the fallback print a second time on every halting run.
+// Simulation-only code inside `ifdef LTG_PERF; no cross-process readers.
+lint_off -rule BLKSEQ -file "*/rtl/ooo/LightningCore.sv"
+
 // tb: mem_data_stall output unused by the testbench (tied 0 inside).
 lint_off -rule PINMISSING -file "*/tb/testbench.sv"
 

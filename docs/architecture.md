@@ -167,6 +167,12 @@ only at retirement.
   prefix-contiguous intake groups (slot w gets DRIS ID fetch_ptr+w);
   contains `BranchShelf` (verifies branches/JALRs, fences retirement via
   oldest-branch id, triggers flush masks on mispredict, trains the BTB).
+  Also exports a set of always-present `perf_*` outputs for the core's
+  counter block (shelf occupancy, branch resolve/mispredict/squashed
+  events, `mispredict_valid`, intake stall + its two reasons, issue fire).
+  They are observation only, and they exist as ports rather than
+  hierarchical references because those aren't portable across VCS and
+  Verilator. See LightningCore's PERF bullet below.
 - `Scheduler.sv` — the integer/phase-1 scheduler: scans a window of DRIS
   entries from the retire pointer for ready instructions, reads operands
   (DRIS lockers or regfile read ports), issues up to EXEC_UNITS
@@ -223,6 +229,36 @@ only at retirement.
     ecall never retires, so `halted` forces one final packet at slot 0
     (pc = `trap_pc`, no register write) to match the refsim, which does
     execute it.
+  - **The performance counters** (very bottom of the file, `` `ifdef
+    LTG_PERF ``, on by default): cycles, retirements, fetches (DRIS
+    intakes, so wrong-path included — the gap between the two is the
+    speculation tax), instruction mix at retirement, front-end blocking
+    (DRIS full / shelf full), flush and mispredict-redirect cycles,
+    cache events, and the OoO utilization set — retires/cycle plus
+    histogram, DRIS and branch-shelf occupancy (avg/max/cycles-full),
+    integer and memory issue-slot usage plus histogram. Averages
+    accumulate as ints and divide only in the print task. Printed on the
+    `halted` edge, with a `final`-block fallback (guarded by a
+    `perf_printed` flag, the same pattern as `commit_verifier`'s `dumped`)
+    so a watchdog-killed run still reports. Three things to know:
+    - **The switch is `` `LTG_PERF ``, not `` `PERF ``.** `rtl/core` is
+      compiled before `rtl/ooo` and `riscv_core.sv` is in every build
+      regardless of `CORE`, so its `` `define PERF `` is already in scope
+      here — sharing the name would make this file's switch a no-op. Same
+      macro-leak trap `1DRIS_defs.sv` documents for `DEBUG`.
+    - Data the core can't see itself arrives as **always-present ports**,
+      never hierarchical references (which behave differently across VCS
+      and Verilator): cache events fan in from `riscv_core_interface`, and
+      shelf occupancy / branch-resolution events / intake-stall reasons
+      come out of the IIU as `perf_*` outputs. Only the counters are
+      `` `ifdef ``'d, so the port list is the same shape in every build.
+    - Branch counting happens at the **shelf**, not at retirement (a
+      mispredicted branch's wrong-path youngers never retire). `resolved`
+      / `mispredicted` / `squashed` reconcile with the front end's
+      `mispredict redirects` as *mispredicted − squashed = redirects*:
+      a branch that resolves wrong in the same cycle an **older**
+      mispredict flushes the shelf is itself wrong-path and never gets its
+      own redirect. Do not expect mispredicts and redirects to be equal.
 - `SaneStateController.sv` — retirement: walks the DRIS from the retire
   pointer, retires completed entries in program order up to the branch
   fence, drives `reg_commits` to the regfile write ports (highest way =

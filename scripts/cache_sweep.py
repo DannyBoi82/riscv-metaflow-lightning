@@ -133,25 +133,45 @@ def run_synth(dest_dir: str, tag: str, params: str, dry_run: bool):
 
 # ── Perflog parser ────────────────────────────────────────────────────────────
 
-# Patterns keyed to the $display strings in riscv_core.sv
+# Patterns keyed to the $display strings in the two cores' PERF blocks:
+# rtl/core/riscv_core.sv (in-order) and rtl/ooo/LightningCore.sv (Lightning
+# OoO). The metrics that mean the same thing on both cores deliberately use
+# the same $display strings, so most keys need only one pattern; where the
+# wording differs, list the alternatives and the first one that matches wins.
+# A key that no core in this run reports simply stays None.
+#
+# Keep this table in sync when either core's printout changes — it silently
+# parses nothing otherwise, which reads exactly like a zero.
 PERF_PATTERNS = {
-    "cycles":       r"total cycles:\s+(\d+)",
-    "fetched":      r"total fetch cycles:\s+(\d+)",
-    "stall_total":  r"total stall cycles:\s+(\d+)",
-    "stall_FD":     r"stall for FD:\s+(\d+)",
-    "stall_EMW":    r"stall for EMW:\s+(\d+)",
-    "hits_i":       r"hits for instr:\s+(\d+)",
-    "miss_i":       r"misses for instr:\s+(\d+)",
-    "evict_i":      r"eviction for instr:\s+(\d+)",
-    "hits_d":       r"hits for data:\s+(\d+)",
-    "miss_d":       r"misses for data:\s+(\d+)",
-    "evict_d":      r"eviction for data:\s+(\d+)",
-    "num_i_acc":    r"num of instr calls:\s+(\d+)",
-    "num_d_acc":    r"num of data calls:\s+(\d+)",
-    "conflicts":    r"conflicts for i & d:\s+(\d+)",
-    "alu_insts":    r"ALU inst num:\s+(\d+)",
-    "load_insts":   r"Num loads:\s+(\d+)",
-    "store_insts":  r"Num stores:\s+(\d+)",
+    # ---- shared ----
+    "cycles":       [r"total cycles:\s+(\d+)"],
+    "fetched":      [r"total fetch cycles:\s+(\d+)",        # in-order
+                     r"instructions fetched:\s+(\d+)"],     # lightning
+    "flush_cycles": [r"flush cycles:\s+(\d+)"],
+    "evict_i":      [r"I\$ evictions:\s*(\d+)"],
+    "hits_i":       [r"I\$ evictions:\s*\d+\s*\|\s*hits:\s*(\d+)"],
+    "miss_i":       [r"I\$ evictions:\s*\d+\s*\|\s*hits:\s*\d+\s*\|\s*misses:\s*(\d+)"],
+    "evict_d":      [r"D\$ evictions:\s*(\d+)"],
+    "hits_d":       [r"D\$ evictions:\s*\d+\s*\|\s*hits:\s*(\d+)"],
+    "miss_d":       [r"D\$ evictions:\s*\d+\s*\|\s*hits:\s*\d+\s*\|\s*misses:\s*(\d+)"],
+    "num_i_acc":    [r"I\$ accesses:\s*(\d+)"],
+    "num_d_acc":    [r"D\$ accesses:\s*(\d+)"],
+    "conflicts":    [r"I\$/D\$ conflicts:\s*(\d+)"],
+    "alu_insts":    [r"ALU:\s+(\d+)"],
+    "load_insts":   [r"Loads:\s+(\d+)"],
+    "store_insts":  [r"Stores:\s+(\d+)"],
+    # ---- in-order only (no OoO analogue; see LightningCore's PERF block) ----
+    "stall_total":  [r"total stall cycles:\s+(\d+)"],
+    "stall_FD":     [r"stall for FD:\s+(\d+)"],
+    "stall_EMW":    [r"stall for EMW:\s+(\d+)"],
+    # ---- lightning only ----
+    "retired":          [r"instructions retired:\s+(\d+)"],
+    "ct_insts":         [r"Control transfers:\s+(\d+)"],
+    "intake_stall":     [r"intake stall cycles:\s+(\d+)"],
+    "stall_dris_full":  [r"DRIS full:\s+(\d+)"],
+    "stall_shelf_full": [r"branch shelf full:\s+(\d+)"],
+    "mispredicts":      [r"mispredict redirects:\s+(\d+)"],
+    "branches_resolved":[r"resolved:\s+(\d+)"],
 }
 
 def parse_perflog(log_path: str) -> dict:
@@ -161,10 +181,12 @@ def parse_perflog(log_path: str) -> dict:
             text = f.read()
     except FileNotFoundError:
         return metrics
-    for key, pat in PERF_PATTERNS.items():
-        m = re.search(pat, text)
-        if m:
-            metrics[key] = int(m.group(1))
+    for key, pats in PERF_PATTERNS.items():
+        for pat in pats:
+            m = re.search(pat, text)
+            if m:
+                metrics[key] = int(m.group(1))
+                break
     return metrics
 
 
@@ -176,9 +198,12 @@ def aggregate_metrics(per_test: List[dict]) -> dict:
             if v is not None:
                 agg[k] += v
 
-    # CPI = cycles / retired_instructions
-    # retired = alu + load + store (all non-control-flow) — adjust if you track branches too
-    retired = agg["alu_insts"] + agg["load_insts"] + agg["store_insts"]
+    # CPI = cycles / retired instructions. Lightning reports retirements
+    # directly (and its instruction mix excludes the halting ecall, which
+    # never reaches a retire slot); the in-order core doesn't, so fall back
+    # to summing its non-control-flow mix there.
+    retired = agg["retired"] or (
+        agg["alu_insts"] + agg["load_insts"] + agg["store_insts"])
     agg["retired_insts"] = retired
     agg["cpi"] = round(agg["cycles"] / retired, 4) if retired > 0 else None
 
@@ -217,7 +242,10 @@ def sweep(which: str, tests: List[str], dry_run: bool) -> List[dict]:
         params = ltg_params(
             i=cfg if which == "I" else I_FIXED,
             d=cfg if which == "D" else D_FIXED,
-            extra="+define+PERF",
+            # Each core has its own counter switch: `PERF (in-order) and
+            # `LTG_PERF (Lightning). Define both so the sweep gets a
+            # printout whichever CORE it is pointed at.
+            extra="+define+PERF +define+LTG_PERF",
         )
 
         # Simulate all test cases
@@ -262,6 +290,10 @@ TABLE_COLS = [
     ("evict_d",      "evict_D",       9),
     ("stall_FD",     "stall_FD",      9),
     ("stall_EMW",    "stall_EMW",    10),
+    # Lightning's front-end blocking, the OoO stand-in for the stall columns
+    # above; both sets print "—" on the core that doesn't report them.
+    ("intake_stall", "fe_stall",      9),
+    ("mispredicts",  "mispred",       8),
     ("conflicts",    "conflicts",    10),
 ]
 

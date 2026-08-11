@@ -108,7 +108,35 @@ module InstructionIssueUnit #(
     input  logic [ADDRESS_SIZE-1:0]   core_rsp_addr,
     input  logic                      core_rsp_data_valid,
     input  logic                      core_rsp_ready,
-    input  logic                      core_rsp_excpt
+    input  logic                      core_rsp_excpt,
+
+    /* ============================================================
+     * Performance-counter observation ports.
+     *
+     * Always present (the PERF block that consumes them lives in
+     * LightningCore and is the only `ifdef'd part), and observation
+     * only — none of these feed back into the IIU. The alternative,
+     * cross-module hierarchical references from the core's counter
+     * block, is not portable across VCS and Verilator, which this
+     * repo has to keep both of.
+     * ============================================================ */
+    // Branch shelf occupancy this cycle, and its capacity, so the core
+    // can normalize without importing BRANCH_SHELF_ENTRIES itself.
+    output logic [$clog2(DRIS_defs::BRANCH_SHELF_ENTRIES+1)-1:0]
+                                      perf_shelf_occupancy,
+    // Shelf resolution events (see BranchShelf below) and the mispredict
+    // pulse they produce one cycle later.
+    output logic                      perf_branch_resolved,
+    output logic                      perf_branch_mispredicted,
+    output logic                      perf_branch_mispredict_squashed,
+    output logic                      perf_mispredict_valid,
+    // Front-end blocking: intake stalled, and why. The two reasons are
+    // reported raw (they can both be true in the same cycle).
+    output logic                      perf_intake_stall,
+    output logic                      perf_stall_dris_full,
+    output logic                      perf_stall_shelf_full,
+    // A fetch group was accepted into the DRIS this cycle.
+    output logic                      perf_issue_fire
 );
 
     /* =================================================================
@@ -478,9 +506,26 @@ module InstructionIssueUnit #(
         .mispredict_branch_id(mispredict_branch_id),
         .oldest_branch_id   (oldest_branch_id),
         .branch_fence_valid (branch_fence_valid),
-        .flush_mask         (flush_mask)
+        .flush_mask         (flush_mask),
+        .perf_resolve_valid (perf_branch_resolved),
+        .perf_resolve_wrong (perf_branch_mispredicted),
+        .perf_resolve_wrong_squashed (perf_branch_mispredict_squashed)
     );
 
+    /* =================================================================
+     * Perf observation drive. shelf_free_count is the shelf's own
+     * output, so occupancy is just its complement; the stall reasons
+     * reuse the exact terms the intake stall is built from above, so a
+     * change to the stall condition can't leave the counters behind.
+     * ================================================================= */
+    assign perf_shelf_occupancy = $clog2(DRIS_defs::BRANCH_SHELF_ENTRIES+1)'(
+                                      DRIS_defs::BRANCH_SHELF_ENTRIES) -
+                                  shelf_free_count;
+    assign perf_mispredict_valid = mispredict_valid;
+    assign perf_intake_stall     = intake_stall;
+    assign perf_stall_dris_full  = core_rsp_data_valid && !dris_room;
+    assign perf_stall_shelf_full = core_rsp_data_valid && !shelf_room;
+    assign perf_issue_fire       = issue_fire;
 
     // TODO: core_rsp_excpt -> instruction-fetch fault (trap plumbing).
 
@@ -557,7 +602,31 @@ module BranchShelf #(
      * ============================================================ */
     output dris_id_t                            oldest_branch_id,
     output logic                                branch_fence_valid,
-    output logic [DRIS_NUM_ENTRIES-1:0]         flush_mask
+    output logic [DRIS_NUM_ENTRIES-1:0]         flush_mask,
+
+    /* ============================================================
+     * Performance-counter observation (always present, so the port
+     * list has the same shape in PERF and non-PERF builds; only the
+     * counters that consume these are `ifdef'd, up in LightningCore).
+     * Pure observation — nothing here feeds back into the shelf.
+     *
+     * A resolution is the cycle an UNDET entry's status is decided
+     * (step 2 below), which is one per cycle at most; perf_resolve_wrong
+     * is that same event when the prediction missed. The mispredict
+     * *pulse* it eventually produces is one cycle later and is counted
+     * separately in the core.
+     *
+     * The two do not have to be equal, which is why the third signal
+     * exists: steps (3) and (6) can overwrite a just-written WRONG
+     * status before anyone sees it, when an *older* branch mispredicts
+     * in the same cycle (or a trap wipes the shelf). Such a branch was
+     * genuinely mispredicted but is itself wrong-path, so it never gets
+     * its own redirect. perf_resolve_wrong_squashed counts exactly those,
+     * making the two counts reconcile.
+     * ============================================================ */
+    output logic                                perf_resolve_valid,
+    output logic                                perf_resolve_wrong,
+    output logic                                perf_resolve_wrong_squashed
 );
 
     /* =================================================================
@@ -774,7 +843,25 @@ module BranchShelf #(
         end
     end : btb_training
 
-    
+    /* =================================================================
+     * Perf observation: the resolve event and its verdict. Same
+     * condition and same comparison step (2) uses to write the status,
+     * kept next to the training block so the two can't drift.
+     * ================================================================= */
+    assign perf_resolve_valid = entry_resolve_valid;
+    assign perf_resolve_wrong = entry_resolve_valid &&
+                                (shelf[resolve_slot].correct_pc !=
+                                 shelf[resolve_slot].predicted_pc);
+
+    /* Read back the *final* next_shelf, after steps (3)-(6) have had their
+     * say: if the WRONG this cycle wrote isn't there any more, an older
+     * mispredict's flush (3) or a trap wipe (6) overwrote it, and this
+     * branch never gets to redirect. resolve_slot can only be an entry that
+     * was UNDET in the registered shelf, so allocation (5) and the OK retire
+     * (4) can't be the ones that changed it. */
+    assign perf_resolve_wrong_squashed = perf_resolve_wrong &&
+                                         (next_shelf[resolve_slot].status != WRONG);
+
     /* ---- (1) Update-bus snoop ------------------------------------
      * For every UNDET entry, check each update_bus port for the
      * branch's OWN DRIS ID (completion-watching, not dependency

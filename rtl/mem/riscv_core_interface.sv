@@ -156,7 +156,20 @@ module riscv_core_interface (
         .core_rsp_ready_d      (core_rsp_ready_d),
         .core_rsp_excpt_d      (core_rsp_excpt_d),
         .core_rsp_id_d         (core_rsp_id_d),
-        .core_rsp_ctrl_signals_d (core_rsp_ctrl_signals_d)
+        .core_rsp_ctrl_signals_d (core_rsp_ctrl_signals_d),
+
+        /* Cache-event fan-in for the core's PERF counters. These wires
+         * exist here already (the controllers below drive them); the core
+         * is the only place with a cycle counter to normalize them
+         * against. Same plumbing as riscv_core_interface_inorder. */
+        .is_eviction_i         (is_eviction_i),
+        .read_hit_i            (read_hit_i),
+        .read_miss_i           (read_miss_i),
+        .is_eviction_d         (is_eviction_d),
+        .read_hit_d            (read_hit_d),
+        .read_miss_d           (read_miss_d),
+        .choose_d_cache        (choose_d_cache),
+        .i_d_conflict          (i_d_conflict)
     );
 
     // i-cache fixed signals (request/cancel now come from the core's IIU)
