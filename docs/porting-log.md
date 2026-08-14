@@ -702,19 +702,30 @@ reference in `NewDris.sv`), so this is purely the syntax fix.
 
 What the numbers say, for whoever tunes this next:
 
+> **Two of these bullets were disproven the same day by direct experiment —
+> see the `2026-08-11 (later)` entry below and `docs/perf-counters.md`. The
+> `LTG_DRIS_ENTRIES` and `LTG_BRANCH_SHELF_ENTRIES` recommendations are
+> withdrawn: both knobs move the *stall attribution* on spmv without moving
+> the cycle count at all.** The rest stands.
+
 - **Execute width is not the bottleneck anywhere.** 0.55-0.68 integer slots
   used per cycle out of 4 ways (14-17%). Widening EXECUTE_WAYS would buy
   nothing; the starvation is upstream.
-- **DRIS capacity is the bottleneck on dhrystone and spmv** — intake blocked
-  36% and 54% of all cycles respectively, entirely on `dris_room`. spmv also
-  sits at 22.8/32 average occupancy. That is the knob to sweep next
-  (`LTG_DRIS_ENTRIES`), and it matches the HEAD~1 commit message's finding
-  that going to 32 entries bought ~20% over the in-order core.
+- ~~**DRIS capacity is the bottleneck on dhrystone and spmv**~~ — intake is
+  blocked 36% and 54% of all cycles respectively, entirely on `dris_room`,
+  and spmv sits at 22.8/32 average occupancy, but *blocked is not the same as
+  limited*: doubling to `LTG_DRIS_ENTRIES=64` changes spmv by +9 cycles out
+  of 15.45M. The intake-stall counters report whichever structure happens to
+  be full, not what limits throughput.
 - **fft is prediction-bound instead**: DRIS-full is noise (11k cycles) but it
-  takes 349k mispredict redirects at a 27% mispredict rate.
-- **spmv is the only benchmark where the branch shelf ever blocks intake**
-  (1.6M cycles), so `LTG_BRANCH_SHELF_ENTRIES` is worth a look there and
-  nowhere else.
+  takes 349k mispredict redirects at a 27% mispredict rate. (This one holds
+  up against the in-order baseline: fft is also where Lightning takes 3× the
+  baseline's I$ misses.)
+- ~~**spmv is the only benchmark where the branch shelf ever blocks intake**~~
+  (1.6M cycles) — true as stated, but not actionable:
+  with a 64-entry DRIS the shelf simply absorbs the pressure (shelf-full rises
+  to 6.7M cycles) and the runtime is unchanged. `LTG_BRANCH_SHELF_ENTRIES` is
+  not the knob.
 - Note `retire_drought` is high everywhere (69% of cycles on dhrystone) while
   DRIS occupancy is mid-range — retire bandwidth is not the constraint;
   entries are sitting un-executed.
@@ -727,3 +738,145 @@ entries), integer slots 0.1% used, only 112k instructions retired in 20M
 cycles — and 2,199,096 I$ misses against 40,160 hits with 618,471 evictions.
 That is fetch starvation / I-cache thrashing, not an OoO-engine deadlock,
 which is a different place to start looking than `fibm.c`'s hang.
+
+(Amended below: the in-order core runs kosarajus to a `Correct` result in
+15,291,881 cycles, so the *program* is fine and this is Lightning-specific.
+And the eviction figure quoted here should not be trusted — `is_eviction` is
+broken on both cores, see the next entry.)
+
+## 2026-08-11 (later): the in-order core as baseline
+
+Ran all four `tests/perf` benchmarks on `CORE=inorder` under VCS to get the
+number Lightning actually has to beat. Full standing, the counter inventory
+with per-counter trust status, and the reproduction commands now live in
+**`docs/perf-counters.md`**; that file is the living reference. Summary and
+the things that were surprising:
+
+**Lightning currently beats the baseline on one of four benchmarks.**
+dhrystone 12,184,845 → 9,828,242 (1.24× faster); fft 7,527,873 → 7,566,159
+(parity); spmv 12,847,326 → 15,452,918 (**0.83×, 20% slower**); kosarajus
+15,291,881 and `Correct` on the baseline vs the 20M watchdog on Lightning.
+Commit `a3859cd`'s "20% less cycles than the inorder" is right on dhrystone
+and does not generalize.
+
+### In-order IPC has to be computed — its instruction counters are per-cycle
+
+The baseline's `ALU` / `Loads` / `Stores` and branch/JAL/JALR histograms
+increment every cycle straight off W-stage control signals with no validity
+gate (`riscv_core.sv:948-975`), so bubbles and flush cycles land in them. On
+`beqtest` they sum to `97 + 21 = 118` = exactly the cycle count, against 21
+actually-retired instructions. The `rewind` histogram index is worse: it
+samples `correct_branch_prediction`, an **M1** signal, against a **W**
+instruction. Lightning's equivalents are retirement-gated and correct, so
+these rows are not comparable in either direction.
+
+The core does compute a real `total_instructions` (`riscv_core.sv:911-916`)
+but **no `$display` ever emits it**, and it carries the same M1-vs-W mismatch,
+so it would undercount by about one per mispredict. Left alone rather than
+"fixed" silently — the baseline core is the blessed rig.
+
+Instead: retired counts are architecturally identical across cores for a fixed
+binary, so Lightning's (already verified == refsim on 53/53 asm) serves both.
+Confirmed directly — in-order commit traces match the refsim on beqtest /
+depend / memtest2 at 21 / 316 / 93.
+
+### `is_eviction` is unusable on both cores
+
+Gated on `(&way_valid) && (|current_set.metadata)` and only sampled during
+refill (`cache3.sv:373-376`, `:280`). Lightning's spmv reports 244,900 I$
+misses against **8** evictions in a 64-block cache; the baseline's dhrystone
+reports 42,011 D$ misses against **0**. Both impossible. Every eviction number
+recorded in the entry above should be disregarded.
+
+D$ hit/miss also mean different things per core — calibrated on `memtest2`
+(34 loads, 26 stores), the baseline reports 33+1 = loads only, Lightning
+reports 56+4 = loads and stores. The two wrap different controller FSMs
+(`cache_controller_ref` vs `cache_controller2`) around the same `cache3`. I$
+misses are the one cache figure that compares cleanly.
+
+### spmv: two hypotheses tested, both null
+
+| config | cycles |
+|---|---|
+| default | 15,452,918 |
+| `LTG_ICACHE_INDEX_BITS=8` (8× I$) | 15,452,903 |
+| `LTG_DRIS_ENTRIES=64` (2× DRIS) | 15,452,927, still `Correct` |
+
+The I$ null is real, not a define that failed to apply: `parameters.vh:18`
+plumbs it, and behaviour *did* change (I$ evictions 8 → 0) while misses stayed
+at 244,897 vs 244,900. So Lightning's spmv I$ misses are not capacity or
+conflict misses.
+
+The DRIS null is the more useful result — the stall **relocated**: DRIS-full
+8,299,935 → 2,373,424, branch-shelf-full 1,640,554 → 6,681,203, total runtime
+unchanged. That is what disqualifies the intake-stall counters as a diagnosis,
+and it retires the shelf as a candidate too.
+
+Three very different configs landing within 9 cycles of each other means
+something serial dominates spmv that none of these knobs touch. Not memory
+latency — `tb/main_memory.sv` is combinational with no delay model. **Still
+unidentified**, and it is the blocker for Lightning beating the baseline more
+broadly.
+
+### kosarajus is a fetch-path livelock, not speculation
+
+Lightning takes only **12** mispredict redirects across the entire run,
+alongside a 98% I$ miss rate (2,199,096 vs 40,160 hits), a 99%-empty DRIS and
+integer slots at 0.1%. Speculation is not the mechanism. Given the spmv I$
+null, a bigger I$ is unlikely to help either; this needs a waveform on the
+fetch/I$ request path.
+
+## 2026-08-12: fibi perf comparison + the I-fetch bounds checker
+
+### fibi joins the standing (Lightning 1.13×)
+
+Ran `tests/c/fibi.c` on both cores under VCS at defaults, into separate
+`OUTPUT_BASE_DIR` trees. Identical register dumps, both matching the
+`fibi.reg` oracle. Lightning 22,438 cycles vs the baseline's 25,321 — 1.13×,
+IPC 1.003 vs 0.889. Second win after dhrystone, and a different mechanism:
+the DRIS never fills (avg 5.6 of 32, **zero** intake stall cycles) and integer
+slots sit at 29.9% of 4, so this is not an occupancy win. Numbers and the
+full breakdown in `docs/perf-counters.md` §1.1.
+
+### The I$ miss count is the whole story, and it is not wrong-path addresses
+
+fibi's text is **196 bytes**. That is 13 blocks of a 64-block I$ — the entire
+program resident with 80% of the cache spare, cold-miss floor 13. The baseline
+takes 21 misses. Lightning takes **858**.
+
+Hypothesis: wrong-path fetch running off into the `0xdedede...` segment fill.
+Built `tb/ifetch_bounds_check.sv` to settle it — taps `core_req_re` /
+`core_req_addr` at the core→I$ seam, puts back the two implied low bits (the
+core drives pc[31:2]), and range-checks against the program image actually
+loaded, sizing `mem.text.bin` / `mem.ktext.bin` with the same `$fseek`/`$ftell`
+idiom `main_memory` uses. That is the same extent the test's disassembly
+covers, without parsing anything: it computed text as `[0x00400000,
+0x004000c4)` against a disassembly whose last instruction is `jalr` at
+`0x4000bc` with `unimp` at `0x4000c0`.
+
+Instantiated in **both** core interfaces under `ifdef SIMULATION_18447` so
+synth is untouched, with `CORE_NAME` telling them apart in the log. Reports
+rather than fails by default — wrong-path fetch past the end of the program is
+legal behaviour on an OoO core and the point was to measure it, not to ban it;
+`+define+IFETCH_BOUNDS_FATAL` makes the first one fatal. Costs no cycles: both
+cores' totals are identical with it in.
+
+**Hypothesis disproven.** In-order: 0 out-of-bounds. Lightning: 5, all
+`0x004000d0`, on cycles 22428–22432 — the last five cycles of the run, 12 bytes
+off the end while the machine drains at halt. Both cores report exactly one
+unknown-address request, on cycle 1: the X fetch PC out of reset, benign but
+worth knowing the checker sees it.
+
+So all 858 misses are requests for addresses *inside* a 196-byte program.
+Nothing is evicted by capacity or conflict, which means lines are being
+installed and then lost, or never installed. The number sitting next to 858 is
+**793 mispredict redirects** (792 flush cycles) — about one extra miss per
+redirect over a 13-block floor. Prime suspect is the `core_req_cancel` path:
+a redirect killing an in-flight refill so the line never lands and the
+post-mispredict re-fetch misses again. That would also explain the 2026-08-11
+spmv I$ sizing null — if lines are dropped rather than evicted, no cache size
+helps. Unconfirmed; needs cancels instrumented against refill completions in
+`cache_controller2`. `docs/perf-counters.md` §4.1 and open question 5.
+
+fibi is a 22K-cycle reproduction of this, against multi-million-cycle perf
+benchmarks — iterate there.

@@ -117,6 +117,15 @@ per-instruction trace (`statetrace` command).
   the pipe to W and feed `register_file`'s commit inputs; packets exit
   through a `SIMULATION_18447`-guarded `commit_pkts` port. `TRACE`/`PERF`
   ifdefs enable a per-cycle $display trace and performance counters.
+  **This core is the performance baseline** Lightning is measured against;
+  see `docs/perf-counters.md` for where that stands. Its `` `define PERF ``
+  (line 36) is unconditional and leaks into every build, which is why
+  Lightning's switch had to be named `` `LTG_PERF ``. Two counter caveats
+  live here: the instruction-mix and branch/JAL/JALR counters increment
+  every cycle off W-stage signals with no validity gate (they sum to the
+  cycle count, not the instruction count), and the one real retired counter,
+  `total_instructions`, is never printed and is mis-gated on an M1 signal.
+  Compute in-order IPC from the architectural retired count instead.
 - `lib.sv` — small structural pieces used by riscv_core: `mux`, `adder`,
   `register`, `RDDataMux` (load-align/writeback select), `DataMasker`
   (store lane shift), `DataStoreMaskGenerator`, `riscv_alu`,
@@ -259,6 +268,14 @@ only at retirement.
       a branch that resolves wrong in the same cycle an **older**
       mispredict flushes the shelf is itself wrong-path and never gets its
       own redirect. Do not expect mispredicts and redirects to be equal.
+    - **`docs/perf-counters.md` is the reference for what these numbers
+      mean and which of them to trust** — the full inventory for both
+      cores with per-counter trust status, the standing against the
+      in-order baseline, and the knob sweeps already run. Read it before
+      drawing a conclusion from a PERF log. In particular `is_eviction` is
+      broken on both cores, D$ hit/miss counts differ in meaning between
+      them, and the in-order core's instruction-mix and branch counters are
+      per-cycle W-stage samples rather than instruction counts.
 - `SaneStateController.sv` — retirement: walks the DRIS from the retire
   pointer, retires completed entries in program order up to the branch
   fence, drives `reg_commits` to the regfile write ports (highest way =
@@ -289,6 +306,9 @@ only at retirement.
 - `riscv_core_interface_inorder.sv` — **inorder** wrapper (the old class
   seam): riscv_core + two `cache_controller_ref` (instances `tony`/
   `tony_d`), same outer port list as the lightning wrapper.
+- Both wrappers instantiate `ifetch_bounds_check` (instance
+  `ifetch_bounds`, `ifdef SIMULATION_18447` so synth is untouched) on the
+  core→I$ request seam — see the tb section.
 - `cache_controller_ref.sv` — refactored class write-through controller
   (1-word responses, 2-deep response FIFO, live request acceptance).
 - `cache_controller2.sv` — writeback / write-allocate controller, same
@@ -328,6 +348,22 @@ only at retirement.
   in the tb verifier, not here.
 - `riscv_register_names.vh` — ISA/ABI register name table for pretty
   register dumps.
+- `ifetch_bounds_check.sv` — I-side fetch address checker, instantiated by
+  *both* core interfaces (`CORE_NAME` distinguishes them in the log).
+  Samples `core_req_re`/`core_req_addr` at the core→I$ seam, shifts the
+  word address back up by 2 (the core drives pc[31:2]), and range-checks
+  it against the program actually loaded: `[USER_TEXT_START, +sizeof
+  mem.text.bin)` and `[KERNEL_TEXT_START, +sizeof mem.ktext.bin)`, sized
+  with the same `$fseek`/`$ftell` idiom `main_memory` uses. Reports, does
+  not fail — wrong-path fetch past the end of the program is legal on an
+  OoO core, and the point is to *measure* it; `+define+IFETCH_BOUNDS_FATAL`
+  makes the first violation fatal. Emits the bounds at time 0, the first
+  20 violations inline (prefix `IFETCH-OOB:`), an end-of-run summary
+  (requests, in-bounds footprint, out-of-bounds count + distinct
+  addresses, unknown-address count), and the complete per-address record
+  — address, request count, first cycle — to `ifetch_oob.log` in the
+  simulation directory. Costs no cycles; both cores' counts are unchanged
+  with it in.
 - `commit_verifier.sv` — consumes `commit_pkts` at top level: shadow
   architectural regfile (packets applied slot-serialized through a
   blocking temp so halt-edge commits are dump-visible), one full-state

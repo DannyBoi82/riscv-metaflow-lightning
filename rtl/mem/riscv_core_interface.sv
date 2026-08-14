@@ -172,6 +172,20 @@ module riscv_core_interface (
         .i_d_conflict          (i_d_conflict)
     );
 
+`ifdef SIMULATION_18447
+    /* Watches the fetch address the core hands the I-cache and reports any
+     * request outside the loaded program image (tb/ifetch_bounds_check.sv).
+     * Reporting only, unless built with +define+IFETCH_BOUNDS_FATAL. */
+    ifetch_bounds_check #(
+        .ADDRESS_SIZE (ADDRESS_SIZE),
+        .CORE_NAME    ("lightning")
+    ) ifetch_bounds (
+        .clk, .rst_l,
+        .core_req_re   (core_req_re_i),
+        .core_req_addr (core_req_addr_i)
+    );
+`endif
+
     // i-cache fixed signals (request/cancel now come from the core's IIU)
     assign core_req_we_i         = 1'b0;
     assign core_req_store_mask_i = 4'b0000;

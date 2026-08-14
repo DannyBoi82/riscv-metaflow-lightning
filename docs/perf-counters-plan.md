@@ -1,5 +1,13 @@
 # Plan: performance counters for Lightning
 
+> **EXECUTED** 2026-08-11, commit `a09bb2e`. Kept for the rationale; it is no
+> longer the current state of things. For what exists now, which counters are
+> trustworthy, and where Lightning stands against the in-order baseline, see
+> **`docs/perf-counters.md`**. Two corrections to what follows: the switch
+> shipped as `` `LTG_PERF ``, not `` `PERF `` (the in-order core's `PERF`
+> leaks into every build), and sanity checks 3 and 4 below are **false** on
+> both cores — see the `2026-08-11` entries in `docs/porting-log.md`.
+
 Implementation plan for adding an `ifdef PERF` counter block to the
 Lightning OoO core, mirroring (and extending) the one the in-order core
 already has. Written for an implementing agent; all file/line anchors

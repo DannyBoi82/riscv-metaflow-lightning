@@ -28,6 +28,9 @@ structure changes.
   test. RV32I only (no M): mul tests can't be oracled with it.
 - Hardware knobs: `LTG_*` in `rtl/include/config.vh`, overridden per run via
   `PARAMS='+define+LTG_...=N'`. Build knobs: `config.mk`.
+- `PARAMS='+define+IFETCH_BOUNDS_FATAL'` turns the I-fetch bounds checker
+  (`tb/ifetch_bounds_check.sv`, on by default, reporting-only) into a hard
+  stop on the first fetch outside the loaded program image.
 - `PARAMS='+define+DEBUG'` adds the debug pc/instruction fields to the OoO
   packets and DRIS entries (waveform readability + `insn` in commit
   packets). It builds and passes the same tests as a normal build; keep it
@@ -54,7 +57,24 @@ structure changes.
   (caller-saved register residue). Local GCC ≠ class GCC ⇒ residue diffs,
   not bugs. On AFS this does not bite: all four tests/perf benchmarks
   (dhrystone, fft, kosarajus, spmv) verify clean on `CORE=inorder` under
-  VCS, byte-identical binaries to the pre-OoO reference build.
+  VCS, byte-identical binaries to the pre-OoO reference build. On
+  `CORE=lightning` three of the four verify clean; **kosarajus hits the
+  watchdog** (a Lightning-side fetch-path livelock — the baseline runs the
+  same binary to a `Correct` result in 15.3M cycles).
+- **The in-order core is also the performance baseline.** Lightning
+  currently beats it on dhrystone (1.24×) and `tests/c/fibi.c` (1.13×),
+  ties on fft, and is 20% slower on spmv. `docs/perf-counters.md` has the
+  standing, the counter inventory with per-counter trust status (several
+  counters on both cores are known-bad), the knob sweeps already tried,
+  and the hypotheses ruled out.
+- **Lightning's open bug is I$ misses, and it is not wrong-path
+  addresses.** fibi's 196-byte program fits in 13 of the I$'s 64 blocks,
+  yet Lightning misses 858 times (baseline: 21). `tb/ifetch_bounds_check.sv`
+  (runs by default on both cores, `grep IFETCH`) shows every one of those
+  requests is in bounds, so lines are being dropped rather than evicted —
+  suspect the `core_req_cancel` refill path, ~1 extra miss per mispredict
+  redirect. See `docs/perf-counters.md` §4.1. Use fibi (22K cycles) to
+  iterate, not the perf benchmarks (millions).
 - **C is compiled `-march=rv32i` (`RISCV_ARCH_C`), assembly `rv32im`
   (`RISCV_ARCH`).** Do not collapse these back into one knob. Nothing here
   decodes M, so any MUL/DIV GCC emits for ordinary C silently corrupts
