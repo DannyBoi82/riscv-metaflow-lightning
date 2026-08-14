@@ -31,9 +31,17 @@
 // each file as a separate compilation unit; see rtl/core/lib.sv).
 import internal_defines_pkg::*;
 
-// Trace & perf are simulation-only. Comment out before synthesis / submission.
+// Trace & perf are simulation-only, so PERF is auto-defined only in
+// simulation builds rather than needing a manual comment-out before
+// synthesis (the same treatment LTG_PERF gets in rtl/ooo/LightningCore.sv).
+// An explicit +define+PERF still wins. Note these macros leak into every
+// file compiled after this one, which is why Lightning has its own switch.
 //`define TRACE
+`ifndef PERF
+`ifdef SIMULATION_18447
 `define PERF
+`endif
+`endif
 
 // Either TRACE or PERF needs the per-stage instr/imm tracking signals to
 // exist. DEBUG_PIPELINE is the umbrella define for "any debug propagation".

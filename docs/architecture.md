@@ -76,7 +76,19 @@ per-instruction trace (`statetrace` command).
   `PARAMS='+define+LTG_...=N'`.
 - `lint.vlt` — documented Verilator waivers (style categories global-off +
   targeted waivers). Keep `make lint` at zero warnings.
-- `synth/dc_synth.tcl` — broken AFS symlink; synthesis is AFS-host-only.
+- `synth/dc_synth.tcl` — the Design Compiler script (in-repo, was an AFS
+  symlink to the 447 class copy that still expected `447src/`/`src/`). Takes
+  `project_dir`, and optionally `clock_period`, `core`, and `defines`;
+  discovers sources like the Makefile (`rtl/core rtl/ooo rtl/mem`, sorted per
+  dir, one `riscv_core_interface` per `CORE`) plus an explicit `tb_src` list
+  of the hardware that lives under `tb/` — DC is never handed the testbench
+  directory wholesale, because tb module *headers* sit outside their
+  `ifdef SIMULATION_18447 guards and simulation-only types in them are DC
+  errors. `make synth` passes
+  `CORE`, `CLOCK_PERIOD`, and the `+define+` half of `PARAMS`. Synthesis is
+  AFS-host-only. `synth/postprocess.py` swaps DC's numbers for the fake SRAMs
+  with real SRAM area/power; it keys off the top design name
+  `riscv_core_timing`, so don't rename that module.
 
 ## rtl/include — shared packages & macros (all `.vh`, include-guarded)
 
@@ -324,6 +336,16 @@ only at retirement.
   its own always_comb — do not re-merge, see porting log UNOPTFLAT).
 - `sram_simulation.sv` / `sram_synthesis.sv` — SRAM models (1r1w, 1rw,
   1rw1r, 2rw) — sim behavioral vs synthesis-mapped; cache3/BTB use them.
+- `riscv_core_timing.sv` — the **synthesis top** (`make synth` only), whole
+  file inside `ifndef SIMULATION_18447` like `sram_synthesis.sv`, so the sim
+  flow never sees it and `make lint` never lints it. Wraps
+  `riscv_core_interface` and hangs `fake_memory_delay` (a synthesizable but
+  behaviorally fake main memory) off its memory port, so DC's critical path
+  includes a realistic memory-read delay instead of a free constant; the
+  response address/valid are registered off the request for the same reason.
+  Its whole memory port is a top-level port so DC can't optimize the model
+  away. Instance names `RISCV_Core`/`core_inst` are load-bearing: the
+  per-unit timing report in `dc_synth.tcl` keys off that hierarchy.
 
 ## tb — simulation harness (single SV top, valid for Verilator AND VCS)
 
@@ -345,7 +367,13 @@ only at retirement.
   (youngest way wins), optional FORWARD. Verification role: assembles
   `commit_pkt_t` per retire slot from its write-port inputs + the core's
   `commit_valid/commit_pc/commit_insn` inputs. Dump/trace machinery lives
-  in the tb verifier, not here.
+  in the tb verifier, not here. **The only module under `tb/` that is real
+  synthesized hardware**, so it is named explicitly in `dc_synth.tcl`'s
+  `tb_src` list. Everything else in `tb/` is simulation-only; note that the
+  `ifdef SIMULATION_18447` guards there cover module *bodies*, so the headers
+  are still parsed by anything that reads the file (this is why
+  `ifetch_bounds_check.sv` now guards its header too — its `parameter string`
+  is a DC error, VER-700).
 - `riscv_register_names.vh` — ISA/ABI register name table for pretty
   register dumps.
 - `ifetch_bounds_check.sv` — I-side fetch address checker, instantiated by

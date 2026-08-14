@@ -300,12 +300,17 @@ resolves) is the first suspect. Unmeasured so far — see open question 1.
 
 ## 2. Counter inventory
 
-### Lightning — `rtl/ooo/LightningCore.sv`, `` `ifdef LTG_PERF `` (on by default)
+### Lightning — `rtl/ooo/LightningCore.sv`, `` `ifdef LTG_PERF `` (on by default in simulation)
 
 The switch is `` `LTG_PERF ``, **not** `` `PERF `` — `rtl/core` is compiled
-before `rtl/ooo` in every build regardless of `CORE`, so `riscv_core.sv:36`'s
+before `rtl/ooo` in every build regardless of `CORE`, so `riscv_core.sv`'s
 `` `define PERF `` is already in scope and sharing the name would silently make
 this file's switch a no-op. See `docs/architecture.md`.
+
+Auto-defined **only under `SIMULATION_18447`**, so `make synth` gets the
+counters off for free: `print_perf_metrics()` does `real` arithmetic, which DC
+rejects (ELAB-922). Pass `PARAMS='+define+LTG_PERF'` to force them on anyway
+(e.g. to measure what they cost in gates) — the explicit define still wins.
 
 | counter | trust |
 |---|---|
@@ -328,7 +333,7 @@ this file's switch a no-op. See `docs/architecture.md`.
 | I$/D$ evictions | ❌ do not use (§3) |
 | I$/D$ accesses | ⚠️ main-memory port arbitration cycles, not cache probes |
 
-### In-order baseline — `rtl/core/riscv_core.sv`, `` `ifdef PERF `` (`define`d unconditionally at line 36)
+### In-order baseline — `rtl/core/riscv_core.sv`, `` `ifdef PERF `` (`define`d under `SIMULATION_18447`, same as `LTG_PERF` above)
 
 **Rewritten 2026-08-14 to match Lightning's block field for field** — same
 sections in the same order, the same `$display` strings, and the same

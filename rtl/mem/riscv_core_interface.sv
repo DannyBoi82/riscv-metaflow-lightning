@@ -246,8 +246,15 @@ module riscv_core_interface (
         .core_req_store_data    (core_req_store_data_i),
         .core_req_cancel        (core_req_cancel_i),
         .core_req_stall_mem     (core_req_stall_mem_i),
-        .core_req_id            (6'hF), // i-cache requests don't have an ID
-        .core_req_ctrl_signals  ('h0), // i-cache requests don't have control signals
+        /* I-cache requests carry neither an ID nor control signals, and the
+         * I-side never connects core_rsp_id, so these are pure tie-offs.
+         * Sized with '0 rather than 6'hF / 'h0: those were narrower and wider
+         * than dris_id_t / ctrl_signals_t respectively, which simulators
+         * silently zero-extend or truncate but DC rejects outright (LINK-3).
+         * '0 also stays correct if LTG_DRIS_ENTRIES changes dris_id_t's
+         * width, which a literal cannot. */
+        .core_req_id            ('0),
+        .core_req_ctrl_signals  ('0),
         .core_rsp_addr          (core_rsp_addr_i),
         .core_rsp_data          (core_rsp_data_i),
         .core_rsp_data_valid    (core_rsp_data_valid_i),

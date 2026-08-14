@@ -5,6 +5,19 @@
 
 `define DEBUG
 
+/* Lightning's performance counters. Left off by default and turned on from
+ * the command line (`make ... PARAMS='+define+LTG_PERF'`, or PARAMS in
+ * config.mk); scripts/cache_sweep.py passes it.
+ *
+ * Do not uncomment this into a bare `define. print_perf_metrics() in
+ * LightningCore.sv does `real` arithmetic, which Design Compiler rejects
+ * (ELAB-922), so a `define here that nobody remembers to comment out means
+ * `make synth` simply does not run. If it ever needs a default, guard it as
+ * `ifdef SIMULATION_18447 so synthesis gets it off for free — the treatment
+ * riscv_core.sv's `PERF gets. Deliberately NOT named `PERF: macros carry
+ * across files on the compiler command line and rtl/core is compiled before
+ * rtl/ooo (Makefile RTL_DIR_ORDER), so riscv_core.sv's `PERF is already in
+ * scope here; sharing the name would make this switch a no-op. */
 // `ifndef LTG_PERF
 // `define LTG_PERF
 // `endif

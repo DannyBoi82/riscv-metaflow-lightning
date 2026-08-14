@@ -611,6 +611,15 @@ ifneq ($(strip $(CLOCK_PERIOD)),)
     SET_CLOCK_PERIOD = ; set clock_period $(CLOCK_PERIOD)
 endif
 
+# Hardware knobs reach DC the same way they reach the simulators, via PARAMS;
+# DC's analyze -define wants bare NAME=VALUE, so strip the +define+ prefix.
+# Non-define entries in PARAMS (plusargs and the like) are simulation-only and
+# are dropped here.
+SYNTH_DEFINES := $(patsubst +define+%,%,$(filter +define+%,$(PARAMS)))
+ifneq ($(strip $(SYNTH_DEFINES)),)
+    SET_DEFINES = ; set defines {$(SYNTH_DEFINES)}
+endif
+
 .PHONY: synth view-timing view-power view-area synth-clean synth-check-compiler \
 		synth-check-script
 
@@ -620,7 +629,7 @@ $(SYNTH_REPORTS): $(SV_SRC) $(VH_SRC) $(DC_SCRIPT) | $(OUTPUT) \
 		synth-check-compiler synth-check-script
 	@printf "Synthesizing design in $u$(OUTPUT)$n..."
 	@cd $(OUTPUT) && $(SYNTH_CC) -f $(DC_SCRIPT) -x "set project_dir $(PWD); \
-		set lab_18447 4a$(SET_CLOCK_PERIOD)" |& tee $(SYNTH_LOG)
+		set core $(CORE)$(SET_CLOCK_PERIOD)$(SET_DEFINES)" |& tee $(SYNTH_LOG)
 	@printf "\nThe timing report is at $u$(OUTPUT)/$(TIMING_REPORT)$n\n"
 	@if grep -i latch $(OUTPUT)/$(SYNTH_LOG) &> /dev/null; then \
 		printf "$r$bFound disallowed latch inference:$n\n"; \
@@ -647,8 +656,7 @@ endif
 
 synth-check-script:
 ifeq ($(wildcard $(DC_SCRIPT)),)
-	@printf "$rError: $u$(SYNTH_SCRIPT)$n$r does not resolve (it is an "
-	@printf "AFS-hosted script; synthesis only works on CMU machines).$n\n"
+	@printf "$rError: $u$(SYNTH_SCRIPT)$n$r does not exist.$n\n"
 	@exit 1
 endif
 

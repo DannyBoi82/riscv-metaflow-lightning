@@ -38,14 +38,19 @@
 
 `default_nettype none
 
+/* The guard covers the module header too, not just the body: `parameter
+ * string` below is a hard error in Design Compiler (VER-700), and the header
+ * is parsed whether or not the body is. Both instantiation sites
+ * (riscv_core_interface.sv, riscv_core_interface_inorder.sv) are themselves
+ * inside `ifdef SIMULATION_18447, so there is nothing left to bind to here. */
+`ifdef SIMULATION_18447
+
 module ifetch_bounds_check
     #(parameter  int    ADDRESS_SIZE = 30,
       parameter  string CORE_NAME    = "core")
      (input  logic                      clk, rst_l,
       input  logic                      core_req_re,
       input  logic [ADDRESS_SIZE-1:0]   core_req_addr);
-
-`ifdef SIMULATION_18447
 
     import MemorySegments::USER_TEXT_SEGMENT;
     import MemorySegments::KERNEL_TEXT_SEGMENT;
@@ -221,8 +226,8 @@ module ifetch_bounds_check
         end
     end
 
-`endif /* SIMULATION_18447 */
-
 endmodule: ifetch_bounds_check
+
+`endif /* SIMULATION_18447 */
 
 `default_nettype wire
