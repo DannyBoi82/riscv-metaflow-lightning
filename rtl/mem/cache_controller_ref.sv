@@ -77,6 +77,13 @@ module cache_controller_ref #(
     output logic                          is_eviction,
     output logic                          read_hit,
     output logic                          read_miss
+`ifdef SIMULATION_18447
+    ,
+    /* Observation only: the address cache3 currently has in flight, i.e. the
+     * one being tag-compared on any cycle read_hit/read_miss is asserted.
+     * Consumed by tb/icache_shadow.sv; drives nothing in the design. */
+    output logic [ADDRESS_SIZE-1:0]       probe_addr
+`endif
 );
 
     // =======================================================================
@@ -163,7 +170,11 @@ module cache_controller_ref #(
         .memory_data_valid(cache_fill_valid),
         .memory_data      (cache_fill_data),
         .read_data,
+`ifdef SIMULATION_18447
+        .read_addr        (probe_addr),
+`else
         .read_addr        (),
+`endif
         .read_hit         (read_hit),
         .read_miss        (read_miss),
         .is_eviction      (is_eviction),
@@ -458,5 +469,59 @@ module cache_controller_ref #(
         .num_suc_deq(),
         .num_q_elem ()
     );
+
+    // synopsys translate_off
+`ifdef ICACHE_SHADOW
+    /* Refill accounting; the counterpart of the block at the end of
+     * cache_controller2.sv, so the two cores' numbers line up column for
+     * column. Same structural hazard here: the cancel branches in CACHE_RSP
+     * and WAIT_FOR_RSP raise cache3's `cancel` without clearing ud_en, and
+     * cache3 gates the refill write with "cache_we = ud_en && ~cancel", so a
+     * redirect that lands on a fill leaves the block invalid.
+     *
+     * This controller only ever cancels on a resolved M1 mispredict
+     * (core_req_cancel = ~correct_branch_prediction), which is why it is the
+     * control group: lost fills should be rare here. */
+    longint cancel_pulses     = 0;
+    longint fills_started     = 0;
+    longint fills_completed   = 0;
+    longint fills_dropped     = 0;
+    longint fills_abandoned   = 0;
+    longint miss_stall_cycles = 0;
+    logic   cancel_prev       = 1'b0;
+
+    always @(posedge clk) begin: shadow_fill_counters
+        if (rst_l === 1'b1) begin
+            if ((core_req_cancel === 1'b1) && !cancel_prev)
+                cancel_pulses = cancel_pulses + 1;
+            cancel_prev = (core_req_cancel === 1'b1);
+
+            if (mem_req_data_load_en && mem_rsp_ready)
+                fills_started = fills_started + 1;
+            if (ud_en && !core_req_cancel)
+                fills_completed = fills_completed + 1;
+            if (ud_en && core_req_cancel)
+                fills_dropped = fills_dropped + 1;
+            if (core_req_cancel && !ud_en && (state == WAIT_FOR_RSP))
+                fills_abandoned = fills_abandoned + 1;
+            if (read_miss && stall)
+                miss_stall_cycles = miss_stall_cycles + 1;
+        end
+    end: shadow_fill_counters
+
+    final begin
+        $display("\t\t CACHE FILLS (%m):");
+        $display("\t  cancel pulses:           %0d", cancel_pulses);
+        $display("\t  fills started:           %0d", fills_started);
+        $display("\t  fills completed:         %0d", fills_completed);
+        $display("\t  fills dropped (on data): %0d", fills_dropped);
+        $display("\t  fills abandoned (early): %0d", fills_abandoned);
+        $display("\t  lost fills:              %0d   (dropped + abandoned)",
+                fills_dropped + fills_abandoned);
+        $display("\t  miss cycles spent waiting for the bus: %0d",
+                miss_stall_cycles);
+    end
+`endif
+    // synopsys translate_on
 
 endmodule : cache_controller_ref

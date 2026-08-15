@@ -94,6 +94,13 @@ module cache_controller2 #(
     output logic                          is_eviction,
     output logic                          read_hit,
     output logic                          read_miss
+`ifdef SIMULATION_18447
+    ,
+    /* Observation only: the address cache3 currently has in flight, i.e. the
+     * one being tag-compared on any cycle read_hit/read_miss is asserted.
+     * Consumed by tb/icache_shadow.sv; drives nothing in the design. */
+    output logic [ADDRESS_SIZE-1:0]       probe_addr
+`endif
 );
 
     // ---------------- Cache control signals ----------------
@@ -544,7 +551,11 @@ module cache_controller2 #(
         .memory_data_valid     (cache_fill_valid),
         .memory_data           (cache_fill_data),
         .read_data,
+`ifdef SIMULATION_18447
+        .read_addr             (probe_addr),
+`else
         .read_addr             (),
+`endif
         .read_hit,
         .read_miss,
         .is_eviction,
@@ -648,6 +659,62 @@ module cache_controller2 #(
                 $display("%0t %m FILL addr=%h data=%h", $time,
                     {mem_rsp_addr, 2'b00}, mem_rsp_data);
         end
+    end
+`endif
+
+`ifdef ICACHE_SHADOW
+    /* Refill accounting, to pair with tb/icache_shadow.sv's phantom count.
+     *
+     * A cancel does not stop a fill that is already in flight, it only stops
+     * it being written: cache3 gates the refill's SRAM write with
+     * "cache_we = ud_en && ~cancel" and clears curr_inflight on cancel, while
+     * do_fill here is deliberately left out of the cancel strobe-clear below
+     * the FSM. So the line stays invalid and the next probe of it misses
+     * again. These counters size that effect directly, and
+     *
+     *     fills_dropped + fills_abandoned  ==  the shadow's PHANTOM count
+     *
+     * is the prediction that makes it a cause rather than a correlation.
+     * %m distinguishes the I$ (tony) from the D$ (tony_d). */
+    longint cancel_pulses     = 0;   // rising edges of core_req_cancel
+    longint fills_started     = 0;   // bus granted, line fill on its way
+    longint fills_completed   = 0;   // data arrived and was written
+    longint fills_dropped     = 0;   // cancel landed on the data cycle
+    longint fills_abandoned   = 0;   // cancel landed before the data came back
+    longint miss_stall_cycles = 0;   // read_miss re-asserted waiting for the bus
+    logic   cancel_prev       = 1'b0;
+
+    always @(posedge clk) begin: shadow_fill_counters
+        if (rst_l === 1'b1) begin
+            if ((core_req_cancel === 1'b1) && !cancel_prev)
+                cancel_pulses = cancel_pulses + 1;
+            cancel_prev = (core_req_cancel === 1'b1);
+
+            if (mem_bus_request && mem_rsp_ready)
+                fills_started = fills_started + 1;
+            if (do_fill && !core_req_cancel)
+                fills_completed = fills_completed + 1;
+            if (do_fill && core_req_cancel)
+                fills_dropped = fills_dropped + 1;
+            if (core_req_cancel && !mem_rsp_good &&
+                ((state == READ_WAIT_MEM_RSP) || (state == WRITE_WAIT_MEM_RSP)))
+                fills_abandoned = fills_abandoned + 1;
+            if (read_miss && cache_stall)
+                miss_stall_cycles = miss_stall_cycles + 1;
+        end
+    end: shadow_fill_counters
+
+    final begin
+        $display("\t\t CACHE FILLS (%m):");
+        $display("\t  cancel pulses:           %0d", cancel_pulses);
+        $display("\t  fills started:           %0d", fills_started);
+        $display("\t  fills completed:         %0d", fills_completed);
+        $display("\t  fills dropped (on data): %0d", fills_dropped);
+        $display("\t  fills abandoned (early): %0d", fills_abandoned);
+        $display("\t  lost fills:              %0d   (dropped + abandoned)",
+                fills_dropped + fills_abandoned);
+        $display("\t  miss cycles spent waiting for the bus: %0d",
+                miss_stall_cycles);
     end
 `endif
     // synopsys translate_on

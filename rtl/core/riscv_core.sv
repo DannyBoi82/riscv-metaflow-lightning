@@ -224,6 +224,14 @@ module riscv_core
         logic        tempstall_E, tempstall_M1, tempstall_M2, tempstall_W;
         logic        hit_F2, hit_F3, hit_D, hit_E, hit_M1, hit_M2, hit_W;
         logic        taken_branch_M2, taken_branch_W;
+        /* Per-instruction mispredict ("rewind") bit, resolved in M1 and
+         * carried with its own instruction to W. The BTB histograms used to
+         * read correct_branch_prediction — an M1 signal — against the
+         * unrelated instruction sitting in W. */
+        logic        rewind_M2, rewind_W;
+        /* Driven in the PERFORMANCE COUNTERS section; declared here because
+         * the M1->M2 pipeline register above reads them. */
+        logic        perf_ct_mispred_now, perf_mispred_sticky;
     `endif
 
     // ====================================================================
@@ -572,6 +580,8 @@ module riscv_core
                 tempstall_M2    <= stall_M1;
                 hit_M2          <= hit_M1;
                 taken_branch_M2 <= taken_branch_M1;
+                // This instruction's own resolution result (see perf_events).
+                rewind_M2       <= perf_ct_mispred_now | perf_mispred_sticky;
             `endif
         end
     end
@@ -609,6 +619,7 @@ module riscv_core
                 tempstall_W    <= stall_M2;
                 hit_W          <= hit_M2;
                 taken_branch_W <= taken_branch_M2;
+                rewind_W       <= rewind_M2;
             `endif
         end
     end
@@ -782,27 +793,173 @@ module riscv_core
     end
 `endif
 
-    // ====================================================================
-    // PERFORMANCE COUNTERS (PERF only)
-    // ====================================================================
+    /* =================================================================
+     * PERFORMANCE COUNTERS (PERF only)
+     *
+     * Field-for-field the same report as Lightning's block
+     * (rtl/ooo/LightningCore.sv, `ifdef LTG_PERF): same sections in the same
+     * order, same `$display` strings, and the same definition behind every
+     * metric the two machines both have, so the two logs diff line by line
+     * and one set of scripts/cache_sweep.py patterns parses both.
+     *
+     * Where the machines genuinely differ:
+     *
+     *  - The OoO structures (DRIS occupancy, branch shelf) have no analogue
+     *    here, so those two sections are simply absent.
+     *
+     *  - "intake stall cycles" means the same thing on both — cycles the
+     *    machine took no new instruction in, flushes excluded — but the
+     *    breakdown underneath is per-machine: Lightning reports which
+     *    structure was full, this core reports which stall held decode.
+     *
+     *  - Per-cycle events are 0/1 here rather than popcounts, so the
+     *    "per cycle" histograms have two bins. The widths are 1 by
+     *    construction (localparams below), not SUPERSCALAR_WAYS: this
+     *    pipeline retires, executes and issues to memory exactly one
+     *    instruction per cycle.
+     *
+     *  - Everything this pipeline has and Lightning does not (the stall
+     *    breakdown, the run-length histogram, the BTB histograms) is kept,
+     *    collected in one section at the end of the printout.
+     *
+     * Every counter here is retirement- or event-gated. The previous version
+     * of this block sampled W-stage control signals free-running, counting
+     * bubbles and flush cycles as instructions (docs/perf-counters.md §3);
+     * retirement now means `commit_fire`, the same event the commit trace and
+     * the register file see, so `instructions retired` equals the reference
+     * simulator's commit count by construction.
+     *
+     * Averages are accumulate-now, divide-at-print: no `real` arithmetic
+     * outside print_perf_metrics().
+     * ================================================================= */
 `ifdef PERF
+    /* Machine widths for the utilization sections. Written as localparams so
+     * the printout reads like Lightning's ("of %0d"), but they are literals:
+     * this core is single-issue everywhere, independent of the LTG_* knobs. */
+    localparam int PERF_RETIRE_WAYS = 1;
+    localparam int PERF_EXEC_UNITS  = 1;
+    localparam int PERF_MEM_WAYS    = 1;
+
+    // ----- Per-event observation (all 0/1 on this machine) --------------
+    logic perf_retire_now;       // an instruction architecturally retires
+    logic perf_fetch_intake;     // a fetched instruction enters decode
+    logic perf_intake_stall;     // ...none did, and not because of a flush
+    logic perf_stall_backpressure, perf_stall_icache;
+    logic perf_ct_resolve;       // a control transfer resolves in M1
+    logic perf_int_busy, perf_mem_issue;
+    logic perf_ret_alu, perf_ret_load, perf_ret_store, perf_ret_ct;
+
+    always_comb begin : perf_events
+        perf_retire_now = commit_fire;
+
+        /* Intake is the F3->D seam: the point every fetched instruction
+         * passes exactly once, wrong-path ones included, which is what makes
+         * fetched/retired a speculation tax comparable to Lightning's
+         * DRIS-intake count. Mispredict-flush cycles are excluded because D
+         * takes a bubble on those, not valid_F3. */
+        perf_fetch_intake = valid_F3 & ~stall_D & correct_branch_prediction;
+
+        /* An intake stall is a cycle where no instruction entered the machine
+         * and a flush was not the reason - the same thing Lightning's counter
+         * means. It is deliberately *not* gated on valid_F3: back-pressure
+         * here freezes the whole front half, I$ request included, so the
+         * instruction that could not get in is often still upstream of F3
+         * rather than waiting at the seam. Gating on it reports ~0 on a
+         * pipeline that is visibly starved. */
+        perf_intake_stall = stall_D & correct_branch_prediction;
+
+        /* Why intake was blocked. Mutually exclusive and exhaustive:
+         * stall_D is only ever raised by these two cases (see STALL & FLUSH
+         * CONTROL above). The first is the machine refusing an instruction
+         * (Lightning's DRIS-full / shelf-full); the second is the front end
+         * having none to offer, which on Lightning shows up as I$ misses. */
+        perf_stall_backpressure = perf_intake_stall &
+                                  (FD_stall | EMW_stall | ~d_cache_ready);
+        perf_stall_icache       = perf_intake_stall & ~perf_stall_backpressure;
+
+        /* Control transfers are counted where they are decided — in M1, where
+         * correct_branch_prediction is computed — not at retirement, matching
+         * Lightning's "resolved at the shelf". Gated on the edge M1's
+         * contents move to M2 so a stalled M1 isn't counted once per cycle it
+         * waits, and on valid_M1 so the stale post-mispredict copy M1 holds
+         * (see EXtoMEM1) isn't counted a second time. */
+        perf_ct_resolve = valid_M1 & ~stall_M2 &
+                          (ctrl_signals_M1.pc_source != PC_plus4);
+
+        // Execute occupancy. The E stage computes load/store addresses too,
+        // so this is the direct analogue of Lightning's integer slots
+        // including their AGU passes.
+        perf_int_busy = valid_E;
+
+        // One count per memory op as it leaves M1 (the access issues there).
+        perf_mem_issue = valid_M1 & ~stall_M2 &
+                         (ctrl_signals_M1.memRead | ctrl_signals_M1.memWrite);
+
+        // Instruction mix, at retirement, same priority chain as Lightning's.
+        perf_ret_alu   = 1'b0;
+        perf_ret_load  = 1'b0;
+        perf_ret_store = 1'b0;
+        perf_ret_ct    = 1'b0;
+        if (perf_retire_now) begin
+            if      (ctrl_signals_W.pc_source != PC_plus4) perf_ret_ct    = 1'b1;
+            else if (ctrl_signals_W.memRead)               perf_ret_load  = 1'b1;
+            else if (ctrl_signals_W.memWrite)              perf_ret_store = 1'b1;
+            else                                           perf_ret_alu   = 1'b1;
+        end
+    end : perf_events
+
+    /* The redirect itself. correct_branch_prediction is forced true while
+     * `flushing`, so this is one pulse per redirect, not one per flush cycle.
+     * valid_M1 keeps the stale copy out, as above. */
+    assign perf_ct_mispred_now = valid_M1 & ~correct_branch_prediction &
+                                 (ctrl_signals_M1.pc_source != PC_plus4);
+
+    /* A mispredict can pulse while EMW_stall holds M1, and by the time M1
+     * advances `flushing` has already pulled correct_branch_prediction back
+     * high. Latch the pulse so the branch still carries its own rewind bit to
+     * W for the BTB histograms. Cleared when M1 advances, which is the same
+     * edge M2 samples the bit. */
+    always_ff @(posedge clk, negedge rst_l) begin: perf_mispred_latch
+        if (~rst_l)                   perf_mispred_sticky <= 1'b0;
+        else if (~stall_M2)           perf_mispred_sticky <= 1'b0;
+        else if (perf_ct_mispred_now) perf_mispred_sticky <= 1'b1;
+    end
+
     // ----- Cycle / instruction counts -----
-    int elapsed_cycles;
-    int total_instructions;
+    int     elapsed_cycles;
+    longint retired_total;      // commit_fire events
+    longint fetched_total;      // decode intakes (wrong path included)
+    int     ALU_inst_num, Lx_inst_num, Sx_inst_num, CT_inst_num;
+
+    // ----- Front-end blocking / recovery -----
+    int intake_stall_cycles;    // a fetched instruction was held at F3->D
+    int stall_backpressure;     //   ...by a hazard, the D$, or the back half
+    int stall_icache;           //   ...by the I$ not having the instruction
+    int retire_drought_cycles;  // nothing retired at all
+    int mispredict_pulses;      // mispredict redirects taken
+
+    // ----- Branches (resolved in M1, not at retirement) -----
+    int branches_resolved, branches_mispredicted;
+
+    // ----- Utilization -----
+    int     retire_hist[PERF_RETIRE_WAYS+1];
+    int     int_issue_hist[PERF_EXEC_UNITS+1];
+    longint int_slots_used, mem_slots_used;
+
+    // ----- In-order pipeline detail (no OoO analogue) -----
     int total_fetch_instructions;
     int total_stall_cycles;
     int stall_num_FD, stall_num_EMW;
-
-    // ----- Instruction-type counts -----
-    int ALU_inst_num, Lx_inst_num, Sx_inst_num;
 
     // ----- Branch counters indexed by [backward][taken][hit][rewind] -----
     //   backward: se_immediate_W < 0  (i.e. loop branch)
     //   taken:    taken_branch_W
     //   hit:      hit_W (BTB hit at fetch)
-    //   rewind:   ~correct_branch_prediction (we mispredicted)
+    //   rewind:   rewind_W (this instruction's own M1 resolution)
+    // All four are per-instruction values that travelled with the retiring
+    // instruction, and the counters below are gated on its retirement.
     int branch_cnt[2][2][2][2];
-    int flush_cycles;
+    int flush_cycles;           // shared with Lightning
 
     // ----- JAL/JALR counters indexed by [is_link][hit][rewind] -----
     int jal_cnt [2][2][2];   // JAL  : is_link = (rd  == ra)
@@ -823,30 +980,127 @@ module riscv_core
     int stall_icache_case2;   // ~instr_valid &  i_cache_ready
     int stall_icache_case3;   //  instr_valid & ~i_cache_ready
 
+    // Set once the printout has been emitted, so the `final` fallback below
+    // doesn't print a second time over a normal halting run. Blocking-
+    // assigned and cleared in reset for the same reasons as
+    // commit_verifier.sv's `dumped`.
+    logic perf_printed;
+
     // --------------------------------------------------------------------
-    // Pretty-printer (called on syscall halt by both PERF and TRACE blocks)
+    // Pretty-printer
+    //
+    // halt_reached distinguishes a normal end-of-run from the watchdog
+    // fallback, and decides whether the halting instruction counts as
+    // retired: it commits on the halt edge (commit_fire is gated with
+    // `| halted` for exactly that reason), but the counters below freeze on
+    // the same edge, so it never reaches retired_total. Adding it back keeps
+    // `instructions retired` equal to the reference simulator's count and to
+    // the commit trace's line count, which is also how Lightning's block
+    // handles its halting ecall.
     // --------------------------------------------------------------------
-    task automatic print_perf_metrics();
+    function automatic real perf_ratio(input longint num, input longint den);
+        return (den == 0) ? 0.0 : real'(num) / real'(den);
+    endfunction
+
+    task automatic print_perf_metrics(input logic halt_reached);
         int b, t, h, r;
-        $display("\t\t PERFORMANCE METRICS:");
+        longint total_retired;
+        total_retired = retired_total + (halt_reached ? 64'd1 : 64'd0);
+
+        $display("\t\t PERFORMANCE METRICS (in-order):");
+        if (!halt_reached)
+            $display({"\t !! run ended without reaching a halt (watchdog or ",
+                      "early $finish); counters are the state at the cutoff"});
+
         $display("\t total cycles:              %0d", elapsed_cycles);
-        $display("\t total fetch cycles:        %0d", total_fetch_instructions);
-        $display("\t total stall cycles:        %0d", total_stall_cycles);
+        $display("\t instructions retired:      %0d", total_retired);
+        $display("\t instructions fetched:      %0d", fetched_total);
+        $display("\t fetch groups accepted:     %0d", fetched_total);
+        $display({"\t   (a fetch group is one instruction on this core, so ",
+                  "this equals instructions fetched)"});
+        $display("\t IPC:                       %0.3f",
+                 perf_ratio(total_retired, elapsed_cycles));
+        $display("\t CPI:                       %0.3f",
+                 perf_ratio(elapsed_cycles, total_retired));
+        $display("\t speculation tax (fetched/retired): %0.3f",
+                 perf_ratio(fetched_total, total_retired));
+
+        /* Same section as Lightning's, measured at this core's equivalent
+         * seam (F3->D rather than the DRIS intake). The two sub-lines are
+         * the in-order stall causes; Lightning's are its full structures. */
+        $display("\t Front end:");
+        $display("\t  intake stall cycles:      %0d", intake_stall_cycles);
+        $display("\t   back-pressure (FD/EMW/D$): %0d", stall_backpressure);
+        $display("\t   I$ not ready:            %0d", stall_icache);
+        $display("\t  flush cycles:             %0d", flush_cycles);
+        $display("\t  mispredict redirects:     %0d", mispredict_pulses);
+        $display("\t  cycles with no retire:    %0d", retire_drought_cycles);
+
+        $display("\t Non-Control Flow Types (at retirement):");
+        $display("\t  ALU:    %0d", ALU_inst_num);
+        $display("\t  Loads:  %0d", Lx_inst_num);
+        $display("\t  Stores: %0d", Sx_inst_num);
+        $display("\t  Control transfers: %0d", CT_inst_num);
+
+        /* Lightning reports three numbers here because its shelf can resolve
+         * a branch that is itself wrong-path and therefore never redirects.
+         * This pipeline resolves in program order, one control transfer at a
+         * time, so the squashed count is structurally zero and
+         * mispredicted == mispredict redirects above. The line is kept so the
+         * two reports have the same shape. */
+        $display("\t Branches (resolved in M1):");
+        $display("\t  resolved:      %0d", branches_resolved);
+        $display("\t  mispredicted:  %0d", branches_mispredicted);
+        $display("\t   of which squashed by an older flush: 0");
+        $display("\t  mispredict rate: %0.3f",
+                 perf_ratio(branches_mispredicted, branches_resolved));
+
+        $display("\t Retires per cycle:");
+        $display("\t  avg: %0.3f  (max %0d/cycle)",
+                 perf_ratio(retired_total, elapsed_cycles), PERF_RETIRE_WAYS);
+        for (int i = 0; i <= PERF_RETIRE_WAYS; i++)
+            $display("\t    [%0d]: %0d", i, retire_hist[i]);
+
+        /* Lightning's DRIS and branch-shelf utilization sections have no
+         * analogue on this core and are omitted rather than faked. */
+        $display("\t Scheduler utilization:");
+        $display("\t  integer slots used/cycle: %0.3f of %0d (%0.1f%%)",
+                 perf_ratio(int_slots_used, elapsed_cycles), PERF_EXEC_UNITS,
+                 100.0 * perf_ratio(int_slots_used,
+                                    longint'(elapsed_cycles) * PERF_EXEC_UNITS));
+        $display({"\t   (E-stage occupancy; includes address generation for ",
+                  "loads and stores, as Lightning's AGU passes do)"});
+        for (int i = 0; i <= PERF_EXEC_UNITS; i++)
+            $display("\t    [%0d]: %0d", i, int_issue_hist[i]);
+        $display("\t  memory issues/cycle:      %0.3f of %0d",
+                 perf_ratio(mem_slots_used, elapsed_cycles), PERF_MEM_WAYS);
+
+        $display("\t Cache Counters:");
+        $display("\t  I$ evictions: %0d | hits: %0d | misses: %0d", eviction_i, hits_i, miss_i);
+        $display("\t  D$ evictions: %0d | hits: %0d | misses: %0d", eviction_d, hits_d, miss_d);
+        $display("\t  I$ accesses:  %0d | D$ accesses: %0d", num_i_cache, num_d_cache);
+        /* Same wording as Lightning's, and the same caveat: these are
+         * main-memory port arbitration cycles, not cache probes, so
+         * hits+misses will not add up to them. The D$ hit/miss pair is also
+         * loads-only on this core (cache_controller_ref) and loads+stores on
+         * Lightning's (cache_controller2) — see docs/perf-counters.md §3. */
+        $display({"\t   (accesses = main-memory port arbitration cycles, ",
+                  "not cache probes; see hits/misses above)"});
+        $display("\t  I$/D$ conflicts: %0d", num_conflicts);
+
+        // ---- Everything below is in-order only: no OoO analogue exists ----
+        $display("\t In-order pipeline detail:");
+        $display("\t  total fetch cycles:        %0d", total_fetch_instructions);
+        $display("\t  total stall cycles:        %0d", total_stall_cycles);
         $display("\t  stall for FD:             %0d", stall_num_FD);
         $display("\t  stall for EMW:            %0d", stall_num_EMW);
         $display("\t  I$ stall (~valid,~ready): %0d", stall_icache_case1);
         $display("\t  I$ stall (~valid, ready): %0d", stall_icache_case2);
         $display("\t  I$ stall ( valid,~ready): %0d", stall_icache_case3);
-        $display("\t  flush cycles:             %0d", flush_cycles);
 
         $display("\t stall run-length hist:");
         for (int i = 0; i <= 4; i++)
             $display("\t    [%0d]: %0d", i, stall_categories[i]);
-
-        $display("\t Non-Control Flow Types:");
-        $display("\t  ALU:    %0d", ALU_inst_num);
-        $display("\t  Loads:  %0d", Lx_inst_num);
-        $display("\t  Stores: %0d", Sx_inst_num);
 
         $display("\t Branches (back|taken|hit|rewind):");
         for (b = 0; b < 2; b++)
@@ -867,12 +1121,6 @@ module riscv_core
             for (h = 0; h < 2; h++)
                 for (r = 0; r < 2; r++)
                     $display("\t  %0b%0b%0b: %0d", b, h, r, jalr_cnt[b][h][r]);
-
-        $display("\t Cache Counters:");
-        $display("\t  I$ evictions: %0d | hits: %0d | misses: %0d", eviction_i, hits_i, miss_i);
-        $display("\t  D$ evictions: %0d | hits: %0d | misses: %0d", eviction_d, hits_d, miss_d);
-        $display("\t  I$ accesses:  %0d | D$ accesses: %0d", num_i_cache, num_d_cache);
-        $display("\t  I$/D$ conflicts: %0d", num_conflicts);
     endtask
 
     // --------------------------------------------------------------------
@@ -881,7 +1129,8 @@ module riscv_core
     always_ff @(posedge clk, negedge rst_l) begin: perf_metrics
         if (~rst_l) begin
             elapsed_cycles            <= 0;
-            total_instructions        <= 0;
+            retired_total             <= 0;
+            fetched_total             <= 0;
             total_fetch_instructions  <= 0;
             total_stall_cycles        <= 0;
             stall_num_FD              <= 0;
@@ -889,6 +1138,17 @@ module riscv_core
             ALU_inst_num              <= 0;
             Lx_inst_num               <= 0;
             Sx_inst_num               <= 0;
+            CT_inst_num               <= 0;
+            intake_stall_cycles       <= 0;
+            stall_backpressure        <= 0;
+            stall_icache              <= 0;
+            retire_drought_cycles     <= 0;
+            mispredict_pulses         <= 0;
+            branches_resolved         <= 0;
+            branches_mispredicted     <= 0;
+            int_slots_used <= 0; mem_slots_used <= 0;
+            foreach (retire_hist[i])    retire_hist[i]    <= 0;
+            foreach (int_issue_hist[i]) int_issue_hist[i] <= 0;
             eviction_i <= 0; hits_i <= 0; miss_i <= 0;
             eviction_d <= 0; hits_d <= 0; miss_d <= 0;
             num_i_cache <= 0; num_d_cache <= 0; num_conflicts <= 0;
@@ -903,18 +1163,44 @@ module riscv_core
             stall_icache_case3 <= 0;
             flush_cycles       <= 0;
         end
+        /* Freeze on halt: the machine keeps clocking until the testbench's
+         * $finish, and those cycles would otherwise pollute every average.
+         * The halting instruction's own retirement is added back at print
+         * time (see print_perf_metrics). Lightning's block does both. */
         else if (~halted) begin
             elapsed_cycles <= elapsed_cycles + 1;
 
+            // ----- Throughput -----
+            if (perf_retire_now)   retired_total <= retired_total + 1;
+            if (perf_fetch_intake) fetched_total <= fetched_total + 1;
+
+            if (perf_ret_alu)   ALU_inst_num <= ALU_inst_num + 1;
+            if (perf_ret_load)  Lx_inst_num  <= Lx_inst_num  + 1;
+            if (perf_ret_store) Sx_inst_num  <= Sx_inst_num  + 1;
+            if (perf_ret_ct)    CT_inst_num  <= CT_inst_num  + 1;
+
+            // ----- Front-end blocking / recovery -----
+            if (perf_intake_stall)       intake_stall_cycles <= intake_stall_cycles + 1;
+            if (perf_stall_backpressure) stall_backpressure  <= stall_backpressure  + 1;
+            if (perf_stall_icache)       stall_icache        <= stall_icache        + 1;
+            if (~perf_retire_now)        retire_drought_cycles <= retire_drought_cycles + 1;
+            if (~correct_branch_prediction)
+                mispredict_pulses <= mispredict_pulses + 1;
+
+            // ----- Branches -----
+            if (perf_ct_resolve)       branches_resolved     <= branches_resolved + 1;
+            if (perf_ct_mispred_now)   branches_mispredicted <= branches_mispredicted + 1;
+
+            // ----- Utilization -----
+            retire_hist[perf_retire_now] <= retire_hist[perf_retire_now] + 1;
+            int_issue_hist[perf_int_busy] <= int_issue_hist[perf_int_busy] + 1;
+            if (perf_int_busy)  int_slots_used <= int_slots_used + 1;
+            if (perf_mem_issue) mem_slots_used <= mem_slots_used + 1;
+
+            // ----- In-order pipeline detail -----
             // Fetch throughput
             if (~stall_F2)
                 total_fetch_instructions <= total_fetch_instructions + 1;
-
-            // Retired instructions (no bubbles, no wrong-path)
-            if (ctrl_signals_W != CTRL_SIGNALS_NOOP &&
-                instr_W != 32'h00000013 &&
-                correct_branch_prediction)
-                total_instructions <= total_instructions + 1;
 
             // Stall tracking
             if (tempstall_W)                  total_stall_cycles <= total_stall_cycles + 1;
@@ -945,30 +1231,23 @@ module riscv_core
             end
             prev_stall <= tempstall_W;
 
-            // Instruction type (W stage)
-            if (ctrl_signals_W.pc_source == PC_plus4) begin
-                if      (ctrl_signals_W.mem2RF)   Lx_inst_num  <= Lx_inst_num  + 1;
-                else if (ctrl_signals_W.memWrite) Sx_inst_num  <= Sx_inst_num  + 1;
-                else                              ALU_inst_num <= ALU_inst_num + 1;
-            end
-
-            // Branch counters
-            if (ctrl_signals_W.pc_source == PC_cond) begin
+            /* BTB histograms, gated on the retirement of the control transfer
+             * and indexed by its own rewind bit (rewind_W), not by whatever
+             * M1 happened to be resolving this cycle. */
+            if (perf_retire_now && ctrl_signals_W.pc_source == PC_cond) begin
                 automatic logic bwd = se_immediate_W[31];
-                branch_cnt[bwd][taken_branch_W][hit_W][~correct_branch_prediction]
-                    <= branch_cnt[bwd][taken_branch_W][hit_W][~correct_branch_prediction] + 1;
+                branch_cnt[bwd][taken_branch_W][hit_W][rewind_W]
+                    <= branch_cnt[bwd][taken_branch_W][hit_W][rewind_W] + 1;
             end
 
-            // JAL counters
-            if (ctrl_signals_W.pc_source == PC_uncond) begin
-                jal_cnt[rd_W == 5'd1][hit_W][~correct_branch_prediction]
-                    <= jal_cnt[rd_W == 5'd1][hit_W][~correct_branch_prediction] + 1;
+            if (perf_retire_now && ctrl_signals_W.pc_source == PC_uncond) begin
+                jal_cnt[rd_W == 5'd1][hit_W][rewind_W]
+                    <= jal_cnt[rd_W == 5'd1][hit_W][rewind_W] + 1;
             end
 
-            // JALR counters
-            if (ctrl_signals_W.pc_source == PC_indirect) begin
-                jalr_cnt[rs1_W == 5'd1][hit_W][~correct_branch_prediction]
-                    <= jalr_cnt[rs1_W == 5'd1][hit_W][~correct_branch_prediction] + 1;
+            if (perf_retire_now && ctrl_signals_W.pc_source == PC_indirect) begin
+                jalr_cnt[rs1_W == 5'd1][hit_W][rewind_W]
+                    <= jalr_cnt[rs1_W == 5'd1][hit_W][rewind_W] + 1;
             end
 
             // Cache counters
@@ -984,10 +1263,26 @@ module riscv_core
         end
     end
 
-    // Print on halt (TRACE block calls the same task; both gated on syscall).
-    always_ff @(posedge clk) begin
-        if (ctrl_signals_W.syscall)
-            print_perf_metrics();
+    /* Print on the halt edge. `halted` is combinational off W, and the
+     * testbench $finishes on the same edge, so this fires before the run
+     * ends and the counters read here are their pre-edge values. The old
+     * trigger was `ctrl_signals_W.syscall`, which printed once per ecall
+     * rather than once per run. */
+    always_ff @(posedge clk, negedge rst_l) begin: perf_print
+        if (~rst_l) begin
+            perf_printed = 1'b0;
+        end
+        else if (halted && !perf_printed) begin
+            perf_printed = 1'b1;
+            print_perf_metrics(1'b1);
+        end
+    end : perf_print
+
+    /* Fallback for a run that ends any other way — in practice the watchdog
+     * killing a core that never reached its halting ecall. Same pattern as
+     * Lightning's block and commit_verifier.sv; works in both simulators. */
+    final begin
+        if (!perf_printed) print_perf_metrics(1'b0);
     end
 `endif /* PERF */
 
@@ -1038,9 +1333,8 @@ module riscv_core
             $display("\trd:  %0d | data %x", rd_W, rd_data_W);
             $display("\tSign Extended Immediate: %0d", se_immediate_W);
 
-            `ifdef PERF
-                if (syscall_halt) print_perf_metrics();
-            `endif
+            // (The PERF block prints its own metrics on the halt edge, once
+            // per run; TRACE used to call the task here as well.)
         end
     end
 `endif /* TRACE */

@@ -67,14 +67,20 @@ structure changes.
   standing, the counter inventory with per-counter trust status (several
   counters on both cores are known-bad), the knob sweeps already tried,
   and the hypotheses ruled out.
-- **Lightning's open bug is I$ misses, and it is not wrong-path
-  addresses.** fibi's 196-byte program fits in 13 of the I$'s 64 blocks,
-  yet Lightning misses 858 times (baseline: 21). `tb/ifetch_bounds_check.sv`
-  (runs by default on both cores, `grep IFETCH`) shows every one of those
-  requests is in bounds, so lines are being dropped rather than evicted —
-  suspect the `core_req_cancel` refill path, ~1 extra miss per mispredict
-  redirect. See `docs/perf-counters.md` §4.1. Use fibi (22K cycles) to
-  iterate, not the perf benchmarks (millions).
+- **Lightning's I$ miss bug is diagnosed: `core_req_cancel` throws away a
+  miss before any refill is requested.** fibi's 196-byte program fits in 13
+  of the I$'s 64 blocks, yet Lightning misses 858 times (baseline: 21) while
+  issuing only **19** fill requests to memory — 839 misses are killed by a
+  cancel on the cycle they resolve (`cache_controller2.sv:363-370` clears
+  `mem_bus_request` and drops to IDLE). The cancel fires on *correctly
+  predicted* control flow too (`redirect` includes `ct_redirect`, i.e. every
+  JAL and predicted-taken branch): 5,826 cancels against 793 mispredicts.
+  One block, `main+0x50` behind the loop's backward branch, is probed 841
+  times and never installed. `tb/icache_shadow.sv`
+  (`PARAMS='+define+ICACHE_SHADOW'`, `grep 'I$ SHADOW'`) is the instrument;
+  `scripts/icache_shadow_report.py` names the offending blocks. See
+  `docs/perf-counters.md` §4.1a. `e59a386` on `main` claims the fix. Use fibi
+  (22K cycles) to iterate, not the perf benchmarks (millions).
 - **C is compiled `-march=rv32i` (`RISCV_ARCH_C`), assembly `rv32im`
   (`RISCV_ARCH`).** Do not collapse these back into one knob. Nothing here
   decodes M, so any MUL/DIV GCC emits for ordinary C silently corrupts

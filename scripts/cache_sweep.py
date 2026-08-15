@@ -145,8 +145,8 @@ def run_synth(dest_dir: str, tag: str, params: str, dry_run: bool):
 PERF_PATTERNS = {
     # ---- shared ----
     "cycles":       [r"total cycles:\s+(\d+)"],
-    "fetched":      [r"total fetch cycles:\s+(\d+)",        # in-order
-                     r"instructions fetched:\s+(\d+)"],     # lightning
+    "retired":      [r"instructions retired:\s+(\d+)"],
+    "fetched":      [r"instructions fetched:\s+(\d+)"],
     "flush_cycles": [r"flush cycles:\s+(\d+)"],
     "evict_i":      [r"I\$ evictions:\s*(\d+)"],
     "hits_i":       [r"I\$ evictions:\s*\d+\s*\|\s*hits:\s*(\d+)"],
@@ -160,18 +160,22 @@ PERF_PATTERNS = {
     "alu_insts":    [r"ALU:\s+(\d+)"],
     "load_insts":   [r"Loads:\s+(\d+)"],
     "store_insts":  [r"Stores:\s+(\d+)"],
+    "ct_insts":     [r"Control transfers:\s+(\d+)"],
+    "intake_stall": [r"intake stall cycles:\s+(\d+)"],
+    "mispredicts":  [r"mispredict redirects:\s+(\d+)"],
+    "branches_resolved":    [r"resolved:\s+(\d+)"],
+    "branches_mispredicted":[r"mispredicted:\s+(\d+)"],
     # ---- in-order only (no OoO analogue; see LightningCore's PERF block) ----
+    "fetch_cycles": [r"total fetch cycles:\s+(\d+)"],
     "stall_total":  [r"total stall cycles:\s+(\d+)"],
     "stall_FD":     [r"stall for FD:\s+(\d+)"],
     "stall_EMW":    [r"stall for EMW:\s+(\d+)"],
-    # ---- lightning only ----
-    "retired":          [r"instructions retired:\s+(\d+)"],
-    "ct_insts":         [r"Control transfers:\s+(\d+)"],
-    "intake_stall":     [r"intake stall cycles:\s+(\d+)"],
-    "stall_dris_full":  [r"DRIS full:\s+(\d+)"],
-    "stall_shelf_full": [r"branch shelf full:\s+(\d+)"],
-    "mispredicts":      [r"mispredict redirects:\s+(\d+)"],
-    "branches_resolved":[r"resolved:\s+(\d+)"],
+    # ---- intake-stall breakdown: the sub-lines are per-core (which structure
+    #      was full vs which stall held the seam), the total above is shared --
+    "stall_dris_full":   [r"DRIS full:\s+(\d+)"],          # lightning
+    "stall_shelf_full":  [r"branch shelf full:\s+(\d+)"],  # lightning
+    "stall_backpressure":[r"back-pressure \(FD/EMW/D\$\):\s+(\d+)"],  # in-order
+    "stall_ifetch":      [r"I\$ not ready:\s+(\d+)"],                 # in-order
 }
 
 def parse_perflog(log_path: str) -> dict:
@@ -198,12 +202,14 @@ def aggregate_metrics(per_test: List[dict]) -> dict:
             if v is not None:
                 agg[k] += v
 
-    # CPI = cycles / retired instructions. Lightning reports retirements
-    # directly (and its instruction mix excludes the halting ecall, which
-    # never reaches a retire slot); the in-order core doesn't, so fall back
-    # to summing its non-control-flow mix there.
+    # CPI = cycles / retired instructions. Both cores now report retirements
+    # directly, and both count the same thing (the reference simulator's
+    # commit count). The mix fallback is kept only for logs produced before
+    # the in-order core had a retired counter; note that on both cores the
+    # mix excludes the halting instruction, so it is one short.
     retired = agg["retired"] or (
-        agg["alu_insts"] + agg["load_insts"] + agg["store_insts"])
+        agg["alu_insts"] + agg["load_insts"] + agg["store_insts"]
+        + agg["ct_insts"])
     agg["retired_insts"] = retired
     agg["cpi"] = round(agg["cycles"] / retired, 4) if retired > 0 else None
 

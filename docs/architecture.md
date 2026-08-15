@@ -364,6 +364,27 @@ only at retirement.
   — address, request count, first cycle — to `ifetch_oob.log` in the
   simulation directory. Costs no cycles; both cores' counts are unchanged
   with it in.
+- `icache_shadow.sv` — idealized I$ residency model, also instantiated by
+  *both* core interfaces, and inert unless built with
+  `+define+ICACHE_SHADOW`. Models a cache with the same geometry and policy
+  that *never drops a fill*, feeds it the real probe stream, and classifies
+  each real miss as unavoidable (the model missed too) or **phantom** (the
+  model had the block resident). Its input is `cache3`'s existing
+  `read_addr` — the address currently being tag-compared, i.e. the one
+  `read_hit`/`read_miss` refers to — surfaced as a `probe_addr` output on
+  `cache_controller2` and `cache_controller_ref` under
+  `` `ifdef SIMULATION_18447 ``; observation only, it drives nothing. Held
+  `read_miss` levels (a request frozen in `cache3`'s LOAD state while the
+  other cache owns the bus) are collapsed, so it also reports the honest
+  miss-event count next to the miss-*cycle* count the PERF counters print.
+  The same define enables refill accounting in both controllers (`CACHE
+  FILLS`, `%m`-tagged: cancels, fills started/completed/dropped/abandoned).
+  Emits an end-of-run summary (prefix `I$ SHADOW`), the per-block record to
+  `icache_shadow.log`, and with `PLUSARGS='+icache_trace'` a per-probe trace
+  to `icache_probe.log`; `scripts/icache_shadow_report.py` joins the record
+  against the test disassembly. Costs no cycles — register dumps are
+  identical with and without it. This is what diagnosed the I$ miss bug
+  (`docs/perf-counters.md` §4.1a).
 - `commit_verifier.sv` — consumes `commit_pkts` at top level: shadow
   architectural regfile (packets applied slot-serialized through a
   blocking temp so halt-edge commits are dump-visible), one full-state

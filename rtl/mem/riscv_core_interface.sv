@@ -184,6 +184,27 @@ module riscv_core_interface (
         .core_req_re   (core_req_re_i),
         .core_req_addr (core_req_addr_i)
     );
+
+    /* Idealized I$ residency model (tb/icache_shadow.sv). Classifies every
+     * real I$ miss against a cache of the same geometry that never drops a
+     * fill, so avoidable misses can be told apart from the cold-miss floor.
+     * Inert unless built with PARAMS='+define+ICACHE_SHADOW'. */
+    logic [ADDRESS_SIZE-1:0] probe_addr_i;
+
+    icache_shadow #(
+        .ADDRESS_SIZE      (ADDRESS_SIZE),
+        .INDEX_BITS        (INSTR_CACHE_INDEX_BITS),
+        .BLOCK_OFFSET_BITS (INSTR_CACHE_BLOCK_OFFSET_BITS),
+        .WAYS              (INSTR_CACHE_WAYS),
+        .CORE_NAME         ("lightning")
+    ) icache_shadow_i (
+        .clk, .rst_l,
+        .probe_addr      (probe_addr_i),
+        .read_hit        (read_hit_i),
+        .read_miss       (read_miss_i),
+        .is_eviction     (is_eviction_i),
+        .core_req_cancel (core_req_cancel_i)
+    );
 `endif
 
     // i-cache fixed signals (request/cancel now come from the core's IIU)
@@ -232,6 +253,10 @@ module riscv_core_interface (
         .is_eviction            (is_eviction_i),
         .read_hit               (read_hit_i),
         .read_miss              (read_miss_i)
+`ifdef SIMULATION_18447
+        ,
+        .probe_addr             (probe_addr_i)
+`endif
     );
 
     cache_controller2 #(
@@ -272,6 +297,10 @@ module riscv_core_interface (
         .is_eviction            (is_eviction_d),
         .read_hit               (read_hit_d),
         .read_miss              (read_miss_d)
+`ifdef SIMULATION_18447
+        ,
+        .probe_addr             ()
+`endif
     );
 
 endmodule: riscv_core_interface
