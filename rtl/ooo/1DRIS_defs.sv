@@ -293,6 +293,33 @@ package DRIS_defs;
         dris_locker_t locker_2;
     } locker_pair_t;
 
+    /* IIU <-> BranchShelf seam. These live here, not at $unit scope in
+     * InstructionIssueUnit.sv, because BranchShelf.sv is its own file now
+     * and sources are compiled in sorted order per directory — "BranchShelf"
+     * sorts ahead of "InstructionIssueUnit", so a $unit typedef in the
+     * latter is not yet declared when the former's port list is elaborated.
+     * The `1` prefix on this file is what guarantees the package is seen
+     * before either of them. */
+    typedef struct packed {
+        logic [XLEN-1:0] pc;
+        logic [XLEN-1:0] predicted_pc;
+        logic [1:0]      btb_hist;          // 2-bit counter read at predict time
+        dris_id_t        id;                // DRIS ID for register renaming
+        ctrl_signals_t   ctrl_signals;      // control signals for the instruction
+        logic            valid;
+    } shelf_intake_pkt_t;
+
+    // Shelf -> BTB training port: one resolved branch/JALR per cycle.
+    typedef struct packed {
+        logic            valid;
+        logic [XLEN-1:0] pc;                // resolving branch's own PC (write key)
+        logic [XLEN-1:0] next_pc;           // computed next PC (stored as the target)
+        logic            taken;
+        logic            correct;           // prediction matched
+        logic [1:0]      hist;              // counter bits captured at predict time
+        ctrl_signals_t   ctrl_signals;
+    } btb_train_pkt_t;
+
     function automatic dris_id_t slot_id(input logic [DRIS_ID_WIDTH:0] base,
                                          input int w);
         automatic logic [DRIS_ID_WIDTH:0] full = base + (DRIS_ID_WIDTH+1)'(w);

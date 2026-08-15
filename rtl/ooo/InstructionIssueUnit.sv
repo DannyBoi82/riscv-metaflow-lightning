@@ -9,25 +9,9 @@ import internal_defines_pkg::*;     // Control signals struct, ALU ops
 
 `default_nettype none
 
-typedef struct packed {
-    logic [XLEN-1:0] pc;
-    logic [XLEN-1:0] predicted_pc;
-    logic [1:0] btb_hist;               // 2-bit counter read at predict time
-    dris_id_t id;                       // DRIS ID for register renaming
-    ctrl_signals_t ctrl_signals;        // control signals for the instruction
-    logic valid;
-} shelf_intake_pkt_t;
-
-// Shelf -> BTB training port: one resolved branch/JALR per cycle.
-typedef struct packed {
-    logic            valid;
-    logic [XLEN-1:0] pc;                // resolving branch's own PC (write key)
-    logic [XLEN-1:0] next_pc;           // computed next PC (stored as the target)
-    logic            taken;
-    logic            correct;           // prediction matched
-    logic [1:0]      hist;              // counter bits captured at predict time
-    ctrl_signals_t   ctrl_signals;
-} btb_train_pkt_t;
+// shelf_intake_pkt_t and btb_train_pkt_t moved to the DRIS_defs package
+// (rtl/ooo/1DRIS_defs.sv) so BranchShelf.sv, which compiles first, can see
+// them in its port list.
 
 /**
  * InstructionIssueUnit (IIU) — fetch/decode/issue front end + branch shelf.
@@ -59,8 +43,11 @@ typedef struct packed {
  *     controller FIFO; core_req_stall_mem holds the FIFO head while intake
  *     is stalled (DRIS full / shelf full), so the controller doubles as the
  *     skid buffer;
- *   - core_req_cancel drops in-flight probes and queued responses on any
- *     redirect (CT cut, mispredict repair, trap).
+ *   - core_req_cancel drops in-flight probes and queued responses, and is
+ *     raised *only* on a mispredict repair. A CT cut or a trap redirects
+ *     the PC without touching the cache; the F-queue below tracks the
+ *     outstanding requests and squashes those wrong-path responses when
+ *     they arrive, so a redirect no longer throws away a cache line.
  *
  * Issue groups are prefix-contiguous: a group ends at the block boundary
  * (controller clamp), right after the first *redirecting* CT (JAL or
@@ -173,7 +160,31 @@ module InstructionIssueUnit #(
     // work at one held head + one in-flight probe = exactly the FIFO's depth.
     assign core_req_re     = !intake_stall;
     assign core_req_addr   = pc_F[2 +: ADDRESS_SIZE];
-    assign core_req_cancel = redirect;
+    /* Cancel on a mispredict only — never on a CT cut or a trap.
+     *
+     * This used to be `redirect`, which includes ct_redirect: a cut fires on
+     * every JAL and every predicted-taken branch, i.e. on *correctly*
+     * predicted control flow, so fibi raised 5,826 cancels against 793
+     * mispredicts. Because the controller chains a new probe out of every
+     * response cycle, the redirect a group produces lands exactly on the
+     * cycle the next probe's miss resolves, and the cancel override
+     * (cache_controller2.sv:363-370) clears mem_bus_request in the same
+     * block that a read_miss sets it. The fill was therefore never even
+     * requested: 858 I$ misses, 19 fill requests, and one block behind a
+     * backward branch (main+0x50) probed 841 times and never installed.
+     * 839 of the 858 died this way. See docs/perf-counters.md §4.1a.
+     *
+     * A mispredict is rare (793 vs 5,826) and is genuinely wrong-path work,
+     * so cancelling there keeps the bandwidth saving without the pathology.
+     * Everything else redirects the PC and lets the wrong-path responses
+     * arrive, where the F-queue below drops them.
+     *
+     * Note this is *not* free of the same cost in miniature: a mispredict
+     * cancel still abandons an in-flight fill (7 of fibi's 858). Tying this
+     * to 1'b0 would recover those too, at the price of waiting out a
+     * wrong-path fill — cheap only because tb/main_memory.sv is
+     * combinational. Revisit if main memory ever gets a delay model. */
+    assign core_req_cancel = mispredict_valid;
 
     // Sequential next fetch: past everything this request will return
     // (the controller clamps the group at the block boundary).
@@ -204,6 +215,162 @@ module InstructionIssueUnit #(
         if (!reset_n) pc_F <= MemorySegments::USER_TEXT_START;
         else          pc_F <= next_pc;
     end : pc_reg
+
+    /* =================================================================
+     * F-queue — outstanding fetch requests (F1/F2)
+     *
+     * The core tracks what it has asked the I-side controller for, so a
+     * redirect can squash wrong-path *responses on arrival* instead of
+     * killing the request at the source. Without this, dropping
+     * ct_redirect from core_req_cancel is not merely a perf change — it is
+     * wrong: the sequential fetches past a predicted-taken branch would
+     * still arrive at the FIFO head, and slot_valid (which keys off
+     * core_rsp_data_valid alone) would write them into the DRIS as
+     * architectural instructions.
+     *
+     * Two entries, because at most two requests are outstanding: accept at
+     * cycle N -> the probe resolves and enqueues at N+1 -> the response is
+     * visible at the (registered) FIFO head at N+2. f1 is the younger entry
+     * (just accepted, probing); f2 is the older, whose response arrives
+     * next. This mirrors the controller's own 2-deep response FIFO.
+     *
+     * It rests on: every accepted I-side request produces exactly one
+     * response, in order. core_req_we is tied low on this side, so every
+     * accepted request walks IDLE -> READ_CACHE_RSP -> (hit | fill) and
+     * enqueues exactly once. A cancel is the sole exception, and it voids
+     * *all* of them at once (see below). The assertions are what hold that
+     * invariant honest — a tracking desync silently drops instructions,
+     * which is the failure mode that already cost this repo memtest2's
+     * 0x4000a0-0x4000ac (see the core_req_re comment above).
+     *
+     * f2.addr is read only by assertion 1: slot_pc, avail and the CT cut
+     * all derive from core_rsp_addr and must keep doing so.
+     *
+     * Two bits per entry, not one. `busy` is occupancy — a response is
+     * still owed for this request — and `good` is whether it is still on
+     * the fetch path. A CT cut or trap clears `good` and leaves `busy`
+     * alone, because nothing cancelled the cache and the wrong-path
+     * response is still coming; the queue has to be there to receive it.
+     * Folding the two into a single valid bit drops occupancy on the
+     * redirect, and the next wrong-path response then arrives untracked.
+     * ================================================================= */
+    typedef struct packed {
+        logic                    busy;   // a response is still owed
+        logic                    good;   // ...and it is on the current path
+        logic [ADDRESS_SIZE-1:0] addr;
+    } fetch_track_t;
+
+    fetch_track_t f1, f2, f1_n, f2_n;
+
+    // The two enables, and they move independently — that is the whole
+    // point. cache_controller2 chains a new probe out of READ_CACHE_RSP and
+    // READ_WAIT_MEM_RSP, so accept and consume do not travel together the
+    // way the in-order core's fixed F1/F2/F3 shift register assumes:
+    //   hit at N, chained probe misses at N+1 : consume, no accept
+    //   fill completes (do_forward + ready=1) : accept, no consume
+    //   intake stalled                        : neither
+    //   steady-state hits                     : both
+    //
+    // core_rsp_ready is *not* suppressed by the cancel override in
+    // FSM_outputs (cache_issue_read is), so the !core_req_cancel term is
+    // load-bearing: without it a cancel cycle would record a request the
+    // controller never took.
+    logic accept, consume;
+    assign accept  = core_req_re && core_rsp_ready && !core_req_cancel;
+    // The FIFO's actual dequeue condition: num_deq is hardwired to 1 and
+    // peek_only is core_req_stall_mem (= intake_stall), so the head pops
+    // every cycle it is valid and intake is not stalling.
+    assign consume = core_rsp_data_valid && !intake_stall;
+
+    logic ftrack_overrun;   // accept into an already-occupied F1 (assertion 2)
+
+    always_comb begin : fetch_track_next
+        f1_n = f1;
+        f2_n = f2;
+
+        // F2 frees when the response it was owed is taken.
+        if (consume) f2_n = '0;
+
+        // F1 slides into a free F2.
+        if (!f2_n.busy) begin
+            f2_n = f1;
+            f1_n = '0;
+        end
+
+        // Nothing may land on top of a request that has not slid out yet;
+        // core_req_re = !intake_stall and peek_only = intake_stall suppress
+        // accept and consume together, which is what makes this impossible.
+        ftrack_overrun = accept && f1_n.busy;
+
+        // A newly accepted request lands in F1.
+        if (accept) f1_n = '{busy: 1'b1, good: 1'b1, addr: core_req_addr};
+
+        // A redirect marks everything in flight wrong-path — including the
+        // request accepted THIS cycle, since pc_F is still on the sequential
+        // path in the cycle the redirect is computed, so this has to come
+        // after the accept above. `busy` is untouched: those responses are
+        // still on their way and still have to be consumed.
+        if (redirect) begin
+            f1_n.good = 1'b0;
+            f2_n.good = 1'b0;
+        end
+
+        // ...unless this redirect is the one that cancels. The cancel
+        // flushes the controller's response FIFO wholesale
+        // (cache_controller2.sv:504), forces next_state to IDLE (:251) and
+        // suppresses the enqueue strobes (:370), so every outstanding
+        // request is voided and no response is owed for any of them. Clear
+        // occupancy, not just the path bit — leaving `busy` set here would
+        // strand the queue full and trip assertion 2 on the refetch.
+        // Ordering: cancel implies redirect, so this must come last.
+        if (core_req_cancel) begin
+            f1_n = '0;
+            f2_n = '0;
+        end
+    end : fetch_track_next
+
+    always_ff @(posedge clock, negedge reset_n) begin : fetch_track
+        if (!reset_n) begin
+            f1 <= '0;
+            f2 <= '0;
+        end
+        else begin
+            f1 <= f1_n;
+            f2 <= f2_n;
+        end
+    end : fetch_track
+
+    // synopsys translate_off
+    // Fatal, not $error: a desync means a GOOD group is about to be dropped
+    // while pc_F has already run past it. That must crash the run, not show
+    // up as a register mismatch dozens of instructions later.
+    // The `$time > 0` guard is not decoration: the testbench's clk starts at
+    // 1, so its initialization counts as a posedge at time 0 in a 4-state
+    // simulator, and reset_n is still high there (it only pulses low at t=1).
+    // Everything below is X on that edge. The repo's other assertions only
+    // $display and survive it; these are $fatal and would not.
+    always_ff @(posedge clock) begin : fetch_track_assertions
+        if ((reset_n === 1'b1) && ($time > 0)) begin
+            // 1. The model matches reality. Once the invariant above holds
+            //    this is tautological — so if it fires, the model is broken.
+            assert (!(core_rsp_data_valid && f2.busy) ||
+                    (core_rsp_addr == f2.addr))
+            else $fatal(1, "%0t %m: fetch tracking desync - rsp=%h f2=%h",
+                        $time, {core_rsp_addr, 2'b00}, {f2.addr, 2'b00});
+
+            // 2. Never accept into an occupied F1 (would lose a request).
+            assert (!ftrack_overrun)
+            else $fatal(1, "%0t %m: accepted a request with the F-queue full",
+                        $time);
+
+            // 3. A response with nothing outstanding. Also the check that
+            //    the cancel really does void every outstanding request: if
+            //    the FIFO flush ever left one behind, it lands here.
+            assert (!(core_rsp_data_valid && !f1.busy && !f2.busy))
+            else $fatal(1, "%0t %m: response with an empty F-queue", $time);
+        end
+    end : fetch_track_assertions
+    // synopsys translate_on
 
     /* =================================================================
      * Per-slot decode
@@ -369,12 +536,29 @@ module InstructionIssueUnit #(
     logic dris_room, shelf_room, issue_fire;  // intake_stall declared above
     assign dris_room    = (DRIS_NUM_ENTRIES - int'(occupancy)) >= int'(group_count);
     assign shelf_room   = int'(shelf_free_count) >= int'(ct_count);
-    assign intake_stall = core_rsp_data_valid && (!dris_room || !shelf_room);
+    /* f2.good here as well as in issue_fire: a squashed group needs neither
+     * a DRIS entry nor a shelf entry, so it must not be held at the FIFO
+     * head when those are full. Without this term a stale wrong-path head
+     * blocks the redirect target's fetch until retirement drains the DRIS —
+     * not a deadlock (retirement is independent of fetch), but wasted
+     * cycles for nothing. */
+    assign intake_stall = core_rsp_data_valid && f2.good &&
+                          (!dris_room || !shelf_room);
     assign core_req_stall_mem = intake_stall;
 
-    // Gate on mispredict/trap: entries written this cycle would be younger
-    // than the flush point but invisible to the (registered) flush mask.
-    assign issue_fire = core_rsp_data_valid && !intake_stall &&
+    /* f2.good is the wrong-path squash: a CT cut or a trap no longer
+     * cancels the cache, so a response whose request they invalidated still
+     * arrives, and this is where it dies. It is consumed (see `consume`
+     * above) and dropped — no DRIS write, no shelf entry, no fetch_ptr
+     * advance, and ct_redirect inherits the gate for free, so a squashed
+     * group cannot redirect anything either.
+     *
+     * The mispredict/trap terms stay: f2.good is registered and cannot see
+     * a redirect raised this cycle, and entries written this cycle would be
+     * younger than the flush point but invisible to the (registered) flush
+     * mask. The combinational gate covers this cycle, the valid bit covers
+     * every cycle after. */
+    assign issue_fire = core_rsp_data_valid && f2.good && !intake_stall &&
                         !mispredict_valid && !trap_valid;
 
     /* =================================================================
@@ -523,471 +707,10 @@ module InstructionIssueUnit #(
                                   shelf_free_count;
     assign perf_mispredict_valid = mispredict_valid;
     assign perf_intake_stall     = intake_stall;
-    assign perf_stall_dris_full  = core_rsp_data_valid && !dris_room;
-    assign perf_stall_shelf_full = core_rsp_data_valid && !shelf_room;
+    assign perf_stall_dris_full  = core_rsp_data_valid && f2.good && !dris_room;
+    assign perf_stall_shelf_full = core_rsp_data_valid && f2.good && !shelf_room;
     assign perf_issue_fire       = issue_fire;
 
     // TODO: core_rsp_excpt -> instruction-fetch fault (trap plumbing).
 
 endmodule : InstructionIssueUnit
-
-/**
- * BranchShelf
- *
- * Holds in-flight speculative conditional branches including JALR.
-   The shelf keeps track of every pc modifing instruction's predicted
-   and correct PC. Correct PCs are calculated by the main execution unit, so
-   the shelf does not keep track of lockers. Instead, it snoops the update bus
-   for the branch's DRIS ID; when it sees a match, it captures the update's
-   next_pc_W as the correct PC and marks that it has the correct PC.
-    On a mispredict, the shelf produces a flush mask covering every
- * DRIS entry younger than the offending branch and signals fetch to redirect.
- *
- * The shelf never writes the DRIS: JAL/JALR link values ride the exec
- * way's result_data_W, and the exec writeback marks the branch executed.
- *
- * RISC-V deviation from Lightning/SPARC: no condition codes. Branches lock
- * on rs1/rs2 in the DRIS and dispatch like any other instruction, so the
- * patent's CC-locker mechanism disappears — the shelf watches only for
- * the branch's own completion, never its dependencies.
-**/
-module BranchShelf #(
-    parameter int NUM_SHELF_ENTRIES = 8,
-    parameter int NUM_UPDATE_PORTS  = DRIS_defs::EXECUTE_WAYS,
-    parameter int FETCH_WAYS        = DRIS_defs::FETCH_WAYS
-)(
-    input  logic                                clock, reset_n,
-
-    input dris_entry_t dris_entries [DRIS_NUM_ENTRIES-1:0],
-
-    /* ============================================================
-     * Shelving interface
-     * ============================================================ */
-    input  shelf_intake_pkt_t                   [FETCH_WAYS-1:0] shelf_in_pkt,
-    output logic                                [FETCH_WAYS-1:0] shelf_alloc_valid,
-    output logic [$clog2(NUM_SHELF_ENTRIES+1)-1:0] shelf_free_count,
-
-    /* ============================================================
-     * BTB training: the one resolving entry per cycle
-     * ============================================================ */
-    output btb_train_pkt_t                      btb_train,
-
-    /* ============================================================
-     * Update bus snoop
-     *
-     * Each cycle, for every shelf entry waiting on a locker, compare
-     * locker_id against every update_bus[i].id_W. On a match, mark the
-     * locker as clear and capture update_bus[i].result_data_W into the
-     * appropriate operand slot.
-     * ============================================================ */
-    input  dris_writeback_pkt_t                 update_bus [NUM_UPDATE_PORTS-1:0],
-
-    /* ============================================================
-     * Global flush (from SSC on trap retirement)
-     *
-     * Wipes the whole shelf because every DRIS entry the shelf was
-     * tracking has been purged.
-     * ============================================================ */
-    input  logic                                global_flush,
-
-    /* ============================================================
-     * Mispredict output -> fetch redirect
-     * ============================================================ */
-    output logic                                mispredict_valid,
-    output logic [XLEN-1:0]                     mispredict_pc,
-    output dris_id_t                            mispredict_branch_id,
-
-    /* ============================================================
-     * SSC interface
-     * ============================================================ */
-    output dris_id_t                            oldest_branch_id,
-    output logic                                branch_fence_valid,
-    output logic [DRIS_NUM_ENTRIES-1:0]         flush_mask,
-
-    /* ============================================================
-     * Performance-counter observation (always present, so the port
-     * list has the same shape in PERF and non-PERF builds; only the
-     * counters that consume these are `ifdef'd, up in LightningCore).
-     * Pure observation — nothing here feeds back into the shelf.
-     *
-     * A resolution is the cycle an UNDET entry's status is decided
-     * (step 2 below), which is one per cycle at most; perf_resolve_wrong
-     * is that same event when the prediction missed. The mispredict
-     * *pulse* it eventually produces is one cycle later and is counted
-     * separately in the core.
-     *
-     * The two do not have to be equal, which is why the third signal
-     * exists: steps (3) and (6) can overwrite a just-written WRONG
-     * status before anyone sees it, when an *older* branch mispredicts
-     * in the same cycle (or a trap wipes the shelf). Such a branch was
-     * genuinely mispredicted but is itself wrong-path, so it never gets
-     * its own redirect. perf_resolve_wrong_squashed counts exactly those,
-     * making the two counts reconcile.
-     * ============================================================ */
-    output logic                                perf_resolve_valid,
-    output logic                                perf_resolve_wrong,
-    output logic                                perf_resolve_wrong_squashed
-);
-
-    /* =================================================================
-     * Per-entry data structure
-     *
-     * Mirrors the patent's branch shelf entry (col. 13-14) but adapted
-     * for RISC-V (no CC locker; rs1/rs2 lockers instead).
-     * ================================================================= */
-    typedef enum logic [1:0] {
-        EMPTY = 2'b00,
-        UNDET = 2'b01,    // waiting on operands
-        OK    = 2'b10,    // resolved, prediction was correct
-        WRONG = 2'b11     // resolved, prediction was wrong
-    } shelf_status_t;
-
-    typedef struct packed {
-        shelf_status_t        status;
-        dris_id_t             branch_id;        // index into DRIS for flush mask + retire
-        logic [XLEN-1:0]      branch_pc;        // branch's own PC (for restart on mispredict)
-
-        logic [XLEN-1:0]      predicted_pc;
-        logic [XLEN-1:0]      correct_pc;
-        logic correct_pc_valid;
-        logic [1:0]           btb_hist;         // counter bits read at predict time
-
-        ctrl_signals_t         ctrl_signals;     // pc_source gates BTB training
-    } shelf_entry_t;
-
-    shelf_entry_t shelf [NUM_SHELF_ENTRIES-1:0];
-    shelf_entry_t next_shelf [NUM_SHELF_ENTRIES-1:0];
-
-    /* =================================================================
-     * Internal signals
-     * ================================================================= */
-    logic [NUM_SHELF_ENTRIES-1:0] entry_empty;
-    logic [NUM_SHELF_ENTRIES-1:0] entry_undet;
-    logic [NUM_SHELF_ENTRIES-1:0] entry_wrong;
-    logic [NUM_SHELF_ENTRIES-1:0] entry_ok;
-    logic [NUM_SHELF_ENTRIES-1:0] entry_ready_to_resolve;  // both lockers clear, status==UNDET
-
-    logic [$clog2(NUM_SHELF_ENTRIES)-1:0] alloc_slot [FETCH_WAYS-1:0];      // where new entries go
-    logic [$clog2(NUM_SHELF_ENTRIES)-1:0] resolve_slot;    // which entry we evaluate this cycle
-    logic [$clog2(NUM_SHELF_ENTRIES)-1:0] oldest_wrong_slot;
-    logic [$clog2(NUM_SHELF_ENTRIES)-1:0] oldest_undet_slot;
-    int unsigned                          alloc_write_slot; // next_shelf index during allocation
-    logic                                 ok_retire_safe;   // no older UNDET/WRONG blocks this OK entry
-
-    /* =================================================================
-     * Status decode
-     * ================================================================= */
-    always_comb begin
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            entry_empty[i] = (shelf[i].status == EMPTY);
-            entry_undet[i] = (shelf[i].status == UNDET);
-            entry_wrong[i] = (shelf[i].status == WRONG);
-            entry_ok[i]    = (shelf[i].status == OK);
-            entry_ready_to_resolve[i] = entry_undet[i] && shelf[i].correct_pc_valid;
-        end
-    end
-
-    /* =================================================================
-     * Allocate slot for incoming branches
-     * ================================================================= */
-    // Claim only for valid packets, so a sparse packet vector (CTs sit at
-    // their slot index) can't strand a younger CT behind empty claims.
-    logic [NUM_SHELF_ENTRIES-1:0] entry_claimed;
-    always_comb begin
-        entry_claimed = '0;
-        for (int i = 0; i < FETCH_WAYS; i++) begin
-            alloc_slot[i] = '0;
-            shelf_alloc_valid[i] = 1'b0;
-            if (shelf_in_pkt[i].valid) begin
-                for (int j = 0; j < NUM_SHELF_ENTRIES; j++) begin
-                    if (entry_empty[j] & ~entry_claimed[j]) begin
-                        alloc_slot[i] = j;
-                        shelf_alloc_valid[i] = 1'b1;
-                        entry_claimed[j] = 1'b1;
-                        break;
-                    end
-                end
-            end
-        end
-    end
-
-    always_comb begin
-        shelf_free_count = '0;
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++)
-            shelf_free_count += entry_empty[i] ? 1'b1 : 1'b0;
-    end
-
-    /* =================================================================
-     * Pick the oldest entry to resolve this cycle
-     * ================================================================= */
-    logic entry_resolve_valid;
-    always_comb begin
-        resolve_slot = '0;
-        entry_resolve_valid = 1'b0;
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            if (entry_ready_to_resolve[i] & ~entry_resolve_valid) begin
-                resolve_slot = i;
-                entry_resolve_valid = 1'b1;
-            end else if (entry_ready_to_resolve[i] & entry_resolve_valid) begin
-                if (is_older(shelf[i].branch_id, shelf[resolve_slot].branch_id)) begin
-                    resolve_slot = i;
-                end
-            end
-        end
-    end
-
-    /* =================================================================
-     * Find oldest WRONG entry -> drives mispredict redirect + flush mask
-     *
-     * On a mispredict, the oldest WRONG entry's branch_id defines the
-     * cut. Anything younger gets flushed. The shelf itself also drops
-     * everything younger than that ID.
-     * ================================================================= */
-    logic entry_wrong_valid;
-    always_comb begin
-        oldest_wrong_slot = '0;
-        entry_wrong_valid = 1'b0;
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            if (entry_wrong[i] & ~entry_wrong_valid) begin
-                oldest_wrong_slot = i;
-                entry_wrong_valid = 1'b1;
-            end else if (entry_wrong[i] & entry_wrong_valid) begin
-                if (is_older(shelf[i].branch_id, shelf[oldest_wrong_slot].branch_id)) begin
-                    oldest_wrong_slot = i;
-                end
-             end
-        end
-    end
-
-    /* =================================================================
-     * Find oldest UNDET entry -> branch fence for SSC
-     *
-     * Per DRIS patent ("supplies the Retire process with the ID of the
-     * oldest speculative branch to prevent retiring that branch").
-     * The SSC must not retire past this branch until it resolves.
-     * ================================================================= */
-    always_comb begin
-        oldest_undet_slot   = '0;
-        oldest_branch_id    = '0;
-        branch_fence_valid  = 1'b0;
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            if (entry_undet[i] & ~branch_fence_valid) begin
-                oldest_undet_slot = i;
-                oldest_branch_id = shelf[i].branch_id;
-                branch_fence_valid = 1'b1;
-            end else if (entry_undet[i] & branch_fence_valid) begin
-                if (is_older(shelf[i].branch_id, oldest_branch_id)) begin
-                    oldest_undet_slot = i;
-                    oldest_branch_id = shelf[i].branch_id;
-                end
-             end
-        end
-    end
-
-    /* =================================================================
-     * Mispredict output
-     *
-     * If there's a WRONG entry, broadcast its restart PC to fetch.
-     * - cond branch: restart = was-it-actually-taken ? target_pc : fallthrough_pc
-     *                (we predicted the opposite, so the correct PC is
-     *                the OTHER direction)
-     * - JAL: should never mispredict if BTB caches the target correctly
-     * - JALR: mispredict on target mismatch; restart at the computed target
-     * ================================================================= */
-    always_comb begin
-        mispredict_valid     = |entry_wrong;
-        mispredict_branch_id = shelf[oldest_wrong_slot].branch_id;
-        mispredict_pc        = shelf[oldest_wrong_slot].correct_pc;
-    end
-
-    /* =================================================================
-     * Flush mask
-     *
-     * One bit per DRIS entry. Set every bit whose DRIS ID is younger than
-     * mispredict_branch_id. The DRIS / SSC consumes this to invalidate
-     * wrong-path instructions.
-     * ================================================================= */
-    always_comb begin
-        flush_mask = '0;
-        if (mispredict_valid) begin
-            for (int i = 0; i < DRIS_NUM_ENTRIES; i++) begin
-                if (is_older(mispredict_branch_id, dris_entries[i].id)) begin
-                    flush_mask[i] = 1'b1;
-                end
-            end
-        end
-    end
-
-    /* =================================================================
-     * BTB training: the resolving entry, branches and JALRs only (JAL
-     * targets come from decode; don't burn BTB capacity on them).
-     * "Taken" is derived at resolve: the computed next PC differs from
-     * fall-through. A not-taken resolve stores pc+4 in the target field
-     * (the write is atomic); a later taken-history hit then predicts
-     * fall-through and repairs — worse prediction, never wrong-path.
-     * ================================================================= */
-    always_comb begin : btb_training
-        btb_train = '0;
-        if (entry_resolve_valid &&
-            (shelf[resolve_slot].ctrl_signals.pc_source == PC_cond ||
-             shelf[resolve_slot].ctrl_signals.pc_source == PC_indirect)) begin
-            btb_train.valid        = 1'b1;
-            btb_train.pc           = shelf[resolve_slot].branch_pc;
-            btb_train.next_pc      = shelf[resolve_slot].correct_pc;
-            btb_train.taken        = shelf[resolve_slot].correct_pc !=
-                                     (shelf[resolve_slot].branch_pc + XLEN'(4));
-            btb_train.correct      = shelf[resolve_slot].correct_pc ==
-                                     shelf[resolve_slot].predicted_pc;
-            btb_train.hist         = shelf[resolve_slot].btb_hist;
-            btb_train.ctrl_signals = shelf[resolve_slot].ctrl_signals;
-        end
-    end : btb_training
-
-    /* =================================================================
-     * Perf observation: the resolve event and its verdict. Same
-     * condition and same comparison step (2) uses to write the status,
-     * kept next to the training block so the two can't drift.
-     * ================================================================= */
-    assign perf_resolve_valid = entry_resolve_valid;
-    assign perf_resolve_wrong = entry_resolve_valid &&
-                                (shelf[resolve_slot].correct_pc !=
-                                 shelf[resolve_slot].predicted_pc);
-
-    /* Read back the *final* next_shelf, after steps (3)-(6) have had their
-     * say: if the WRONG this cycle wrote isn't there any more, an older
-     * mispredict's flush (3) or a trap wipe (6) overwrote it, and this
-     * branch never gets to redirect. resolve_slot can only be an entry that
-     * was UNDET in the registered shelf, so allocation (5) and the OK retire
-     * (4) can't be the ones that changed it. */
-    assign perf_resolve_wrong_squashed = perf_resolve_wrong &&
-                                         (next_shelf[resolve_slot].status != WRONG);
-
-    /* ---- (1) Update-bus snoop ------------------------------------
-     * For every UNDET entry, check each update_bus port for the
-     * branch's OWN DRIS ID (completion-watching, not dependency
-     * tracking). On a match, capture the computed next PC.
-     * -------------------------------------------------------------- */
-    always_comb begin
-        next_shelf = shelf;
-        // Defaults for the block-local temporaries below; without these an
-        // (unintended) latch is inferred, which VCS tolerated silently.
-        alloc_write_slot = '0;
-        ok_retire_safe   = 1'b0;
-
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin: update_snoop
-            if (entry_undet[i]) begin
-                for (int k = 0; k < NUM_UPDATE_PORTS; k++) begin
-                    if (update_bus[k].valid_W &&
-                    update_bus[k].id_W == shelf[i].branch_id) begin
-                        next_shelf[i].correct_pc = update_bus[k].next_pc_W;  // capture the PC for potential mispredict redirect
-                        next_shelf[i].correct_pc_valid = 1'b1;  // mark that we have the correct PC and can resolve this entry
-
-                    end
-                end
-            end
-        end: update_snoop
-
-    /* ---- (2) Resolve the picked entry ----------------------------
-     * resolve_slot/entry_resolve_valid come from the earlier block.
-     * Lockers come from the registered shelf, so an entry that just
-     * had its lockers cleared by (1) above resolves next cycle, not
-     * this one. That's the intended 1-cycle latency.
-     *
-     * For unconditional branches (JAL/JALR), the resolution amounts
-     * to "did the BTB predict correctly?" — for JAL the target is
-     * known at decode so the BTB should be right; for JALR we'd
-     * compare rs1+imm against predicted_pc. JALR needs imm in the
-     * entry to do this fully, which it doesn't currently have, so
-     * for now we mark unconditional branches OK on resolution and
-     * leave JALR mispredict detection as a TODO.
-     * -------------------------------------------------------------- */
-    if (entry_resolve_valid) begin
-            next_shelf[resolve_slot].status =
-            (shelf[resolve_slot].correct_pc == shelf[resolve_slot].predicted_pc) ?
-            OK : WRONG;
-        end
-
-    /* ---- (3) Mispredict flush -------------------------------------
-     * Clear the oldest WRONG entry and every entry younger than it.
-     * This fires every cycle a WRONG entry exists — by the next clock
-     * edge it's EMPTY so mispredict_valid drops naturally.
-     * -------------------------------------------------------------- */
-    if (entry_wrong_valid) begin
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            if (i == oldest_wrong_slot) begin
-                next_shelf[i].status = EMPTY;
-            end
-            else if (shelf[i].status != EMPTY &&
-                     is_older(shelf[oldest_wrong_slot].branch_id, shelf[i].branch_id)) begin
-                next_shelf[i].status = EMPTY;
-            end
-        end
-    end
-
-    /* ---- (4) Retire OK entries ------------------------------------
-     * An OK entry is safe to leave when no older entry is UNDET or
-     * WRONG (an older WRONG would flush us anyway via step 3; an
-     * older UNDET might still go WRONG). Multiple OK entries can
-     * retire in the same cycle.
-     * -------------------------------------------------------------- */
-    for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-        if (entry_ok[i]) begin
-            ok_retire_safe = 1'b1;
-            for (int j = 0; j < NUM_SHELF_ENTRIES; j++) begin
-                if ((entry_undet[j] || entry_wrong[j]) &&
-                    is_older(shelf[j].branch_id, shelf[i].branch_id)) begin
-                    ok_retire_safe = 1'b0;
-                end
-            end
-            if (ok_retire_safe) next_shelf[i].status = EMPTY;
-        end
-    end
-
-    /* ---- (5) Allocate incoming branches ---------------------------
-     * For each valid incoming branch, drop it into alloc_slot[i]
-     * (computed in the separate block above). Populate ALL fields,
-     * not just status/branch_id/pc/predicted_pc.
-     *
-     * Note: alloc_slot[i] is computed from the registered entry_empty,
-     * so a slot just freed in step (3) or (4) won't be available
-     * until next cycle. Acceptable for now.
-     * -------------------------------------------------------------- */
-    for (int i = 0; i < FETCH_WAYS; i++) begin
-        if (shelf_in_pkt[i].valid && shelf_alloc_valid[i]) begin
-            alloc_write_slot = alloc_slot[i];
-            next_shelf[alloc_write_slot].status           = UNDET;
-            next_shelf[alloc_write_slot].branch_id        = shelf_in_pkt[i].id;
-            next_shelf[alloc_write_slot].branch_pc        = shelf_in_pkt[i].pc;
-            next_shelf[alloc_write_slot].predicted_pc     = shelf_in_pkt[i].predicted_pc;
-            next_shelf[alloc_write_slot].correct_pc       = '0;
-            next_shelf[alloc_write_slot].correct_pc_valid = 1'b0;
-            next_shelf[alloc_write_slot].btb_hist         = shelf_in_pkt[i].btb_hist;
-            next_shelf[alloc_write_slot].ctrl_signals     = shelf_in_pkt[i].ctrl_signals;
-        end
-    end
-
-    /* ---- (6) Global flush -----------------------------------------
-     * Override everything else: wipe the whole shelf.
-     * -------------------------------------------------------------- */
-    if (global_flush) begin
-        for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-            next_shelf[i].status = EMPTY;
-        end
-    end
-end
-
-    /* =================================================================
-     * State register
-     * ================================================================= */
-    always_ff @(posedge clock or negedge reset_n) begin
-        if (~reset_n) begin
-            for (int i = 0; i < NUM_SHELF_ENTRIES; i++) begin
-                shelf[i] <= '0;  // status field is EMPTY = 0
-            end
-        end
-        else begin
-            shelf <= next_shelf;
-        end
-    end
-
-endmodule : BranchShelf

@@ -1,0 +1,4 @@
+# out-of-bounds I-fetch addresses, core lightning
+# text [0x00400000, 0x004000c4)  ktext [0x80000000, 0x80000000)
+# address     requests  first_cycle
+0x004000d0  9  22427
