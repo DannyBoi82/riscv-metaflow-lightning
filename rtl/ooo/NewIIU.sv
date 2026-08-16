@@ -108,7 +108,7 @@ module InstructionIssueUnit #(
     output logic                      perf_mispredict_valid,
     // Front-end blocking: intake stalled, and why. The two reasons are
     // reported raw (they can both be true in the same cycle).
-    output logic                      perf_intake_stall,
+    output logic                      perf_stall_pc,
     output logic                      perf_stall_dris_full,
     output logic                      perf_stall_shelf_full,
     // A fetch group was accepted into the DRIS this cycle.
@@ -119,7 +119,7 @@ module InstructionIssueUnit #(
 
     always_ff @(posedge clock, negedge reset_n) begin: pc_block_reg
         if (~reset_n) pc <= MemorySegments::USER_TEXT_START;
-        else pc <= next_pc;
+        else if (~stall_pc | flush) pc <= next_pc;
     end
 
     assign core_req_addr = pc[ADDRESS_SIZE-1:2];
@@ -247,20 +247,17 @@ module InstructionIssueUnit #(
         end : slot_decode
     endgenerate
 
-    // //this might be backwards
-    // logic [3:0] slot_valid;
-    // always_comb begin : slot_valid_logic
-    //     case (block_pc_D[0][3:2])
-    //         2'b00: slot_valid = 4'b1111;
-    //         2'b01: slot_valid = 4'b1110;
-    //         2'b10: slot_valid = 4'b1100;
-    //         2'b11: slot_valid = 4'b1000;
-    //     endcase
-    //     slot_valid = slot_valid & {4{~flush}} & {4{core_rsp_data_valid}};
-    // end : slot_valid_logic
-
-    logic [1:0] first_valid_slot;
-    assign first_valid_slot = block_pc_D[0][3:2];
+    //this might be backwards
+    logic [3:0] slot_valid;
+    always_comb begin : slot_valid_logic
+        case (block_pc_D[0][3:2])
+            2'b00: slot_valid = 4'b1111;
+            2'b01: slot_valid = 4'b1110;
+            2'b10: slot_valid = 4'b1100;
+            2'b11: slot_valid = 4'b1000;
+        endcase
+        slot_valid = slot_valid & {4{~flush}} & {4{core_rsp_data_valid}};
+    end : slot_valid_logic
 
     // block_pc_D
     // btb_read_hist_D
@@ -269,15 +266,17 @@ module InstructionIssueUnit #(
     decoded_instr_t accepted_instrs_D [FETCH_WORDS-1:0];
     always_comb begin : intake_group_formation
         accepted_instrs_D    = '0;
-        for (int w = first_valid_slot; w < FETCH_WORDS; w++) begin
-           
+        for (int w = 0; w < FETCH_WORDS; w++) begin
+           if (slot_valid[w]) begin
+                accepted_instrs_D[w] = decoded_instrs_D[w];
+            end
         end
 
     end : intake_group_formation
 
 
     /* =================================================================
-     * Branch shelf intake: one packet per valid CT slot. intake_stall
+     * Branch shelf intake: one packet per valid CT slot. stall_pc
      * guarantees enough free shelf entries for all of them.
      * ================================================================= */
     shelf_intake_pkt_t shelf_in_pkt [FETCH_WORDS-1:0];
@@ -325,6 +324,28 @@ module InstructionIssueUnit #(
         .perf_resolve_wrong_squashed (perf_branch_mispredict_squashed)
     );
 
+    assign flush = trap_valid || mispredict_valid;
+
+    always_comb begin : stall_logic
+        {stall_pc, stall_F1, stall_F2, stall_D} = '0;
+        if (dris_full | shelf_full) begin
+            //if out of space, stall everything
+            {stall_pc, stall_F1, stall_F2, stall_D} = 4'b1111;
+        end else if (~instr_valid & ~i_cache_ready) begin
+            //if the cache pipeline is full and the data isnt back yet
+            //stall everything
+            {stall_pc, stall_F1, stall_F2, stall_D} = 4'b1111;
+        end else if (instr_valid & ~i_cache_ready) begin
+            {stall_pc, stall_F1, stall_F2, stall_D} = 4'b1100;
+        end
+
+        //this still doesnt make sense to me but it works in the inorder core
+        // Remaining cases (~instr_valid &  i_cache_ready) and
+        //                  (instr_valid &  i_cache_ready) need no stall.
+    end : stall_logic
+
+
+
     /* =================================================================
      * Perf observation drive. shelf_free_count is the shelf's own
      * output, so occupancy is just its complement; the stall reasons
@@ -335,7 +356,7 @@ module InstructionIssueUnit #(
                                       DRIS_defs::BRANCH_SHELF_ENTRIES) -
                                   shelf_free_count;
     assign perf_mispredict_valid = mispredict_valid;
-    assign perf_intake_stall     = intake_stall;
+    assign perf_stall_pc     = stall_pc;
     assign perf_stall_dris_full  = core_rsp_data_valid && !dris_room;
     assign perf_stall_shelf_full = core_rsp_data_valid && !shelf_room;
     assign perf_issue_fire       = issue_fire;
