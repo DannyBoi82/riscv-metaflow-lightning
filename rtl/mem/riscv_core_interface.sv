@@ -205,6 +205,20 @@ module riscv_core_interface (
         .is_eviction     (is_eviction_i),
         .core_req_cancel (core_req_cancel_i)
     );
+
+    /* I-side request-stream occupancy (tb/ifetch_inflight.sv). Compare the
+     * "ready but no request" line against the inorder core's, which is 0 by
+     * construction. Inert unless built with PARAMS='+define+IFETCH_INFLIGHT'. */
+    ifetch_inflight #(
+        .CORE_NAME ("lightning")
+    ) ifetch_inflight_i (
+        .clk, .rst_l,
+        .core_req_re         (core_req_re_i),
+        .core_rsp_ready      (core_rsp_ready_i),
+        .core_rsp_data_valid (core_rsp_data_valid_i),
+        .core_req_cancel     (core_req_cancel_i),
+        .halted
+    );
 `endif
 
     // i-cache fixed signals (request/cancel now come from the core's IIU)

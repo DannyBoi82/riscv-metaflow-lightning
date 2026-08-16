@@ -880,3 +880,134 @@ helps. Unconfirmed; needs cancels instrumented against refill completions in
 
 fibi is a 22K-cycle reproduction of this, against multi-million-cycle perf
 benchmarks — iterate there.
+
+## 2026-08-15: the cancel fix lands, and the I$ turns out not to have mattered
+
+Continues the 2026-08-12 entry above and `docs/perf-counters.md` §4.1a. The
+suspect was right, the mechanism was not, and the fix does not buy what the
+last three entries assumed it would.
+
+### `core_req_cancel` is now `mispredict_valid`, and that needs an F-queue
+
+`assign core_req_cancel = redirect` became `= mispredict_valid`
+(`rtl/ooo/InstructionIssueUnit.sv`). `redirect` includes `ct_redirect`, which
+fires on every JAL and every predicted-taken branch — *correctly predicted*
+control flow — so fibi raised 5,826 cancels against 793 mispredicts and threw
+away a cache line each time.
+
+**The one-line change is not safe on its own.** With `ct_redirect` no longer
+cancelling, the sequential fetches past a taken branch still arrive at the
+response FIFO, and `slot_valid` keys off `core_rsp_data_valid` alone — those
+wrong-path instructions would be written into the DRIS as architectural. The
+change needs somewhere for them to die, so the IIU now carries an **F-queue**:
+two entries (matching the controller's 2-deep response FIFO) tracking every
+outstanding request, with `busy` (a response is still owed) and `good` (it is
+still on the fetch path) as separate bits. A CT cut or trap clears `good` only
+— nothing cancelled the cache, so the response is still coming and must be
+received — and `f2.good` gates `issue_fire`, `intake_stall` and the two
+`perf_stall_*` counters. Folding the two bits into one drops occupancy on the
+redirect and the next wrong-path response arrives untracked.
+
+The mispredict cancel needs the opposite handling from `e59a386`'s
+`cancel = 1'b0`: `core_req_cancel` flushes the controller's whole response
+FIFO (`cache_controller2.sv:504`), forces `next_state = IDLE` (:251) and
+suppresses the enqueue strobes (:370), so *every* outstanding request is
+voided at once. The F-queue clears both entries outright on a cancel rather
+than just marking them wrong-path. `accept` is also gated on
+`!core_req_cancel`, because the cancel override clears `cache_issue_read` but
+**not** `core_rsp_ready` — without that term a cancel cycle records a request
+the controller never took. Three `$fatal` assertions hold the invariant.
+
+Verified: `make regress TESTS='tests/asm/*.S' SIM=vcs` is the 3 known mul
+failures and nothing else; fibi and dhrystone both verify `Correct` with
+identical retired counts (22,507 / 4,889,053).
+
+### Build fix: the shelf typedefs had to move into the package
+
+`BranchShelf` now lives in its own file. Sources are compiled in sorted order
+per directory, so `BranchShelf.sv` precedes `InstructionIssueUnit.sv` and the
+`$unit`-scope `shelf_intake_pkt_t` / `btb_train_pkt_t` were not yet declared
+when its port list elaborated — a hard syntax error. Both typedefs moved into
+`package DRIS_defs` (`rtl/ooo/1DRIS_defs.sv`, the `1` prefix is exactly this
+ordering convention). Same reason the DEBUG note at the top of that file
+exists.
+
+### The fix works on the cache and costs cycles
+
+| dhrystone, `core_req_cancel` = | cycles | I$ misses | phantom | lost fills |
+|---|---:|---:|---:|---:|
+| `redirect` (original) | **9,828,242** | 548,085 | 158,045 | 42,042 |
+| `mispredict_valid` | 9,924,185 | 448,076 | 50,035 | 48,049 |
+| `1'b0` (e59a386) | 9,934,184 | **404,047** | **0** | 0 |
+
+Monotonic, and the wrong way round: the closer the I$ gets to its ideal miss
+floor the slower the program runs. **A cancelled miss never requested a fill,
+so it never paid the memory latency** — it was cheap and wasteful, not slow.
+Completing the fill costs 8 cycles on a port the D$ also wants. The original
+cancel was accidentally acting as a "don't fill on speculative fetches"
+filter and that filter was winning.
+
+spmv settles it: I$ misses **244,900 → 260** (940×) for a **78-cycle**
+change in a 15.45M-cycle run.
+
+### The memory model was documented wrong, and it misled all of this
+
+`docs/perf-counters.md` §4.2 said "`tb/main_memory.sv` is combinational, with
+no delay model at all." `main_memory.sv` is combinational, but the testbench
+wraps it in a `delay_buffer` with `DELAY = 8` (`tb/testbench.sv:128-138`) and
+`riscv_core_interface` arbitrates **both** caches onto that one port
+(`:97-108`). Every fill, I$ and D$, pays 8 cycles. The instance is named
+`DataDelayBuffer` and parameterized with `DMEMORY_READ_DELAY`, which is where
+the "D-side only" reading came from. `LTG_IMEM_READ_DELAY` /
+`IMEMORY_READ_DELAY` is imported at `tb/testbench.sv:61` and used nowhere — a
+dead knob, not a second delay.
+
+### Bounding the whole memory system: 16.7%
+
+Set the latency to 1 cycle and read off what disappears — this bounds every
+memory-system improvement at once (non-blocking caches, MSHRs, hit-under-miss,
+prefetch, sizing, port de-contention). dhrystone 9,924,185 → **8,261,978,
+−16.7%**, with about half the latency already being overlapped. And:
+
+- **No D-side miss traffic to parallelize.** dhrystone takes **36** D$ misses
+  in 9.9M cycles. spmv has real traffic (141,208) but freeing all of it is
+  1.13M cycles, **7.3%** against a 20% deficit.
+- **Removing memory latency makes the real bottleneck worse.** Intake stalls
+  *rose* 3.49M → 4.25M; 65% of cycles still retire nothing.
+
+So "an OoO engine can't perform without non-blocking caches" is not what is
+happening here. It is bounded at 16.7% on dhrystone and ~7% on spmv.
+
+`LTG_DMEM_READ_DELAY=0` hangs the core outright — zero retired, watchdog —
+despite `delay_buffer` documenting DELAY=0 as combinational. Latent bug,
+perf-counters open question 8.
+
+### The one real win: an 8 KB I$ is −17% on dhrystone
+
+| dhrystone | cycles | I$ misses | I$ evictions |
+|---|---:|---:|---:|
+| default (1 KB I$) | 9,924,185 | 448,076 | 387,960 |
+| `LTG_ICACHE_INDEX_BITS=8` | **8,240,847 (−17.0%)** | **255** | **0** |
+
+1.48× the in-order baseline, up from 1.24×, and within 0.3% of the
+1-cycle-memory bound — on dhrystone the entire memory-system cost *is* I$
+capacity misses (187 blocks into 64), and sizing collects all of it. The
+2026-08-11 "I$ sizing is a genuine null" result was only ever run on spmv,
+which does not overflow; it does not transfer.
+
+### Two regimes, and a lead on spmv
+
+fibi is **fetch-starved** (DRIS 5.6/32 avg, capacity hit zero times, zero
+intake stalls) — the compute-bound case, still a front-end problem.
+dhrystone and spmv are **DRIS-bound** and were before this work. Don't
+generalize a limiter across them; perf-counters §1.2.
+
+The lead worth chasing (§1.3): on spmv, intake reports **DRIS-full for
+8,299,678 cycles** while the valid-entry count is at capacity for only
+**1,534,113**. Intake uses `fetch_ptr − retire_ptr`; PERF popcounts valid
+entries. For ~6.8M cycles — 44% of the run — the DRIS is *not* full but the
+pointers say it is, i.e. `retire_ptr` is not advancing past finished work.
+That makes spmv's dominant stall a retirement stall with an intake stall's
+name on it, and `branch_fence_valid` is the first suspect. Measure the fence
+hold cycles and histogram the allocated-but-dead gap before touching anything
+in the front end.

@@ -111,7 +111,7 @@
 
 // Number of clock edges of instruction / data memory read delay
 `ifndef LTG_IMEM_READ_DELAY
-`define LTG_IMEM_READ_DELAY 8
+`define LTG_IMEM_READ_DELAY 2
 `endif
 `ifndef LTG_DMEM_READ_DELAY
 `define LTG_DMEM_READ_DELAY 8

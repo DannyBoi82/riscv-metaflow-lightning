@@ -1,6 +1,6 @@
 # Performance counters — what exists, what to trust, where we stand
 
-Status as of 2026-08-12. Companion to `docs/perf-counters-plan.md` (the plan,
+Status as of 2026-08-15. Companion to `docs/perf-counters-plan.md` (the plan,
 now executed) and the `2026-08-11` entries in `docs/porting-log.md` (the
 narrative). This file is the living reference: the counter inventory, their
 trust status, and the current standing against the baseline.
@@ -44,6 +44,12 @@ I$ misses — the one cache figure that means the same thing on both cores
 | fft | 306,182 | 926,409 | 3.0× |
 | spmv | 112 | 244,900 | 2,187× |
 | kosarajus | 198 | 2,199,096 | 11,107× |
+
+> **[2026-08-15] This column is pre-§4.1b.** With the cancel fix Lightning's
+> spmv I$ misses are **260** (not 244,900) and dhrystone's are **448,076**.
+> Crucially the cycle counts in the table above did **not** move with them
+> (spmv by 78 cycles), so do not read this column as a performance gap —
+> see §4.1b. fft and kosarajus have not been re-measured.
 
 Commit `a3859cd` ("32 entry dris => current lightning is 20% less cycles than
 the inorder") is correct **on dhrystone** — 19.3% fewer cycles — but that
@@ -104,6 +110,14 @@ ever requested — Lightning issues **19** fill requests in the entire run — a
 one block behind a predicted-taken backward branch is starved for the whole
 run. 845 of the 858 misses were avoidable.
 
+**[2026-08-15] "Avoidable" turned out not to mean "expensive."** Fixing this
+takes fibi to 20 misses against the 13-block floor and leaves the cycle count
+where it was (22,438 → 22,441); on dhrystone the same fix costs ~1%. A
+cancelled miss never requested a fill, so it never paid the 8-cycle memory
+latency — it was cheap and wasteful, not slow. §4.1b has the three-way
+measurement. Read this section's miss counts as a cache-behaviour pathology,
+not as the front-end's cycle cost.
+
 ### What is and isn't understood
 
 - **fft** has a clean explanation: 3× the I$ misses of the baseline, and
@@ -118,6 +132,58 @@ run. 845 of the 858 misses were avoidable.
   vs 40,160 hits), a 99%-empty DRIS, and integer slots at 0.1%. Speculation is
   not the mechanism here. The baseline completes the same program correctly in
   15.3M cycles, so the program is fine.
+
+### 1.2 Two regimes — do not generalize a limiter across them (2026-08-15)
+
+The benchmarks are in **opposite** states, and a conclusion drawn from one
+does not transfer. Same core, same commit, post-§4.1b fix:
+
+| | DRIS avg (valid-entry) | cycles at capacity | intake stall | regime |
+|---|---:|---:|---:|---|
+| **fibi** | **5.6 / 32** | **0** | **0** | fetch-starved |
+| dhrystone (default) | 16.5 / 32 | 378,058 | 3,487,156 | DRIS-bound |
+| dhrystone (1-cycle mem) | 24.5 / 32 | 550,083 | 4,245,145 | DRIS-bound |
+| dhrystone (8 KB I$) | 24.9 / 32 | 593,960 | 4,484,697 | DRIS-bound |
+| spmv | 22.8 / 32 | 1,534,113 | 8,610,208 | DRIS-bound |
+
+**fibi is starved and never stalls**: the DRIS holds 5.6 of 32 on average, hits
+capacity zero times, and intake never blocks for any reason. Nothing downstream
+is limiting it — the front end simply cannot deliver instructions fast enough,
+which on a 75%-ALU / 25%-control-transfer workload means the redirect rate and
+the one-group-per-cycle intake, not the cache (§4.1b). **This is the
+compute-bound case and it is a fetch problem.**
+
+**dhrystone and spmv are the opposite** and were so before the §4.1b fix. What
+the fix changed is the *degree*: relieving the I$ raised dhrystone's average
+occupancy 16.5 → 24.9 and pushed intake stalls 3.49M → 4.48M. Fetch got
+faster, so the queue behind it filled — the stall relocated rather than
+disappeared, exactly as §4.2 saw when the DRIS was doubled.
+
+Any statement of the form "Lightning's limiter is X" needs to name a regime.
+
+### 1.3 "DRIS full" is mostly not the DRIS being full (2026-08-15)
+
+The two occupancy definitions (§2) disagree by 5.4× on spmv, and the gap is
+the most concrete lead open question 1 has:
+
+| spmv | cycles |
+|---|---:|
+| valid-entry count actually at capacity (32/32) | 1,534,113 |
+| intake reporting **DRIS full** | **8,299,678** |
+
+Intake computes `occupancy = fetch_ptr − retire_ptr`
+(`InstructionIssueUnit.sv:367`); the PERF counter popcounts valid entries. So
+for roughly **6.8M cycles — 44% of the run — intake refuses to accept a group
+because the pointers say full, while only ~23 of 32 entries hold a valid
+instruction.** Entries are allocated but not reclaimed: `retire_ptr` is not
+advancing past work that is already finished.
+
+That makes spmv's dominant stall a **retirement** stall wearing an intake
+stall's label, which is consistent with §4.2 (doubling the DRIS relocated the
+stall to the shelf and moved the cycle count by 9) and with 68% of spmv's
+cycles retiring nothing while the shelf sits at 2.4 of 8. The branch fence
+(`branch_fence_valid`, retirement held until the oldest shelved branch
+resolves) is the first suspect. Unmeasured so far — see open question 1.
 
 ---
 
@@ -143,7 +209,7 @@ this file's switch a no-op. See `docs/architecture.md`.
 | instruction mix at retirement (ALU / loads / stores / control transfers) | ✅ properly retirement-gated |
 | branches resolved / mispredicted / squashed, mispredict rate | ✅ invariant: mispredicted − squashed = redirects |
 | retires per cycle, avg + histogram | ✅ |
-| DRIS occupancy avg / max / cycles-at-capacity | ✅ but ≠ intake's occupancy definition (valid-entry popcount vs `fetch_ptr − retire_ptr`) |
+| DRIS occupancy avg / max / cycles-at-capacity | ✅ but ≠ intake's occupancy definition (valid-entry popcount vs `fetch_ptr − retire_ptr`) — **the two disagree by 5.4× on spmv; that gap is a finding, not noise (§1.3)** |
 | branch shelf occupancy avg / max / cycles-full | ✅ |
 | integer slots used/cycle + histogram, memory issues/cycle | ✅ integer figure includes AGU passes |
 | I$ hits / misses | ✅ comparable to the baseline |
@@ -412,6 +478,104 @@ core ... allows correctness without the use of the cancel signal, so now the
 same line isn't refetched when the pc redirects") is the fix for exactly this.
 Re-running the shadow across the two commits is the before/after measurement.
 
+### 4.1b The fix works and costs cycles — measured (2026-08-15)
+
+The before/after is in. **Dropping the cancel does what it was meant to do to
+the cache and makes the program slower**, monotonically: the closer the I$
+gets to its ideal miss floor, the more cycles dhrystone takes.
+
+dhrystone, VCS, defaults, `+define+ICACHE_SHADOW`. All three retire an
+identical 4,889,053, so these are the same program three ways:
+
+| `core_req_cancel` driven by | cycles | I$ real misses | phantom | fills completed | lost fills |
+|---|---:|---:|---:|---:|---:|
+| `redirect` (original) | **9,828,242** | 548,085 | 158,045 | 350,032 | 42,042 |
+| `mispredict_valid` | 9,924,185 | 448,076 | 50,035 | 386,023 | 48,049 |
+| `1'b0` (e59a386) | 9,934,184 | **404,047** | **0** | 404,046 | 0 |
+
+The `1'b0` row is as clean as this cache can get — real misses land exactly on
+the shadow model's floor, zero phantom, zero lost fills — and it is the
+slowest of the three.
+
+**Why: a cancelled miss is nearly free and a completed fill is not.** The
+cancel killed the miss before a fill was ever requested (§4.1a), so it cost a
+probe and nothing else. Completing that fill costs the 8 cycles the corrected
+§4.2 note describes, on a port the D$ also wants. `mispredict_valid` adds
+~36K completed fills over the original — roughly 288K cycles of port
+occupancy — against ~100K misses saved, and nets +96K cycles. The original
+cancel was accidentally acting as a "don't fill on speculative fetches"
+filter, and under this memory model that filter was winning.
+
+So **the 858-misses-over-a-13-block-floor figure in §1.1 was a real pathology
+in cache behaviour that was costing almost nothing in cycles** — a symptom,
+not the limiter, the same verdict §4.2 reached for the sizing knobs and the
+intake-stall counters. Three independent times now the front end has looked
+like the culprit and has not been.
+
+**spmv is the clinching case.** Same fix (`mispredict_valid`), same defaults:
+
+| spmv | before | after |
+|---|---:|---:|
+| I$ misses | 244,900 | **260** |
+| total cycles | 15,452,918 | **15,452,840** |
+
+A **940× reduction in I$ misses moved the cycle count by 78 cycles**, 0.0005%.
+This retires the §1 "2,187× worse than baseline" I$ row as a performance
+finding: it was real, it is now fixed, and it was worth nothing. It also
+explains §4.2's I$-sizing null from the other direction — sizing could not
+help because misses were never the cost.
+
+### 4.1c How much is the whole memory system worth? — bounded (2026-08-15)
+
+Rather than reason about it, set the memory latency to 1 cycle
+(`+define+LTG_DMEM_READ_DELAY=1`, the shared delay buffer of the corrected
+§4.2 note) and read off what disappears. This upper-bounds *every* possible
+memory-system improvement at once: non-blocking caches, MSHRs, hit-under-miss,
+prefetch, larger caches, port de-contention.
+
+dhrystone, Lightning, identical 4,889,053 retired:
+
+| | latency 8 (default) | latency 1 |
+|---|---:|---:|
+| total cycles | 9,924,185 | **8,261,978 (−16.7%)** |
+| IPC | 0.493 | 0.592 |
+| cycles with no retire | 6,869,497 | 5,365,272 (65%) |
+| **intake stall cycles** | 3,487,156 | **4,245,145 (51%)** |
+| I$ misses | 448,076 | 478,100 |
+| D$ misses | 36 | 36 |
+
+**The entire memory system is worth at most 16.7% on dhrystone**, and about
+half its latency is already being overlapped (7 cycles × 478K fills = 3.35M
+removed, total fell 1.66M). Two further points kill the "OoO needs non-blocking
+caches" hypothesis as an explanation of the current standing:
+
+- **There is no D-side miss traffic to parallelize.** dhrystone takes **36**
+  D$ misses in 9.9M cycles. Memory-level parallelism — the thing a lockup-free
+  cache buys an OoO core — has nothing to work with. spmv, the memory-bound
+  benchmark, has real D$ traffic (141,208 misses) but even making all of it
+  free is 141,208 × 8 = 1.13M cycles, **7.3%** of its 15.45M, against a 20%
+  deficit to the baseline. The memory pipe there runs at 0.154 of 1 issue per
+  cycle.
+- **Removing memory latency makes the actual bottleneck worse.** Intake stalls
+  *rose* 3.49M → 4.25M cycles. Feed the machine faster and it chokes further
+  upstream; 65% of cycles still retire nothing with memory nearly free.
+
+`LTG_DMEM_READ_DELAY=0` is not a usable data point: the core retires **zero**
+instructions and hits the watchdog. `delay_buffer`'s DELAY=0 path claims to be
+combinational; something in the seam does not tolerate it. Latent bug, own
+question (open question 8).
+
+The consistent signal across §4.1b, §4.1c and §4.2 is the **intake/retire
+path** — 51% of dhrystone's cycles and 56% of spmv's are intake stalls, and
+they persist or grow as every other structure is relieved.
+
+What is worth keeping from the fix: the miss counters now mean what they say
+(phantom ≈ 0), which makes them usable as an instrument for the next
+question rather than a distraction. The F-queue that makes any non-`redirect`
+cancel *correct* — wrong-path responses are squashed on arrival instead of
+being cancelled at the source — is a prerequisite for all three rows above,
+not an optional part of the middle one.
+
 A useful side-effect: the shadow's miss-event count and the controller's
 bus-wait cycle count are independent measurements of the same discrepancy, and
 they agree. In-order fibi reports 19 miss events + 2 bus-wait cycles = the 21
@@ -435,6 +599,24 @@ I$ evictions moved 8 → 0 — while misses stayed at 244,897 vs 244,900. So
 Lightning's spmv I$ misses are **not capacity or conflict misses**, and no
 amount of I$ sizing recovers that benchmark.
 
+> **[2026-08-15] Do not generalize this null past spmv.** It was only ever
+> run on spmv, whose 187-block-free working set does not overflow a 64-block
+> I$ — there was no capacity problem to fix. dhrystone genuinely overflows
+> (187 distinct blocks into 64, §4.1a), and there the same knob is the
+> largest single win measured on this core so far:
+>
+> | dhrystone | cycles | vs default | I$ misses | I$ evictions |
+> |---|---:|---|---:|---:|
+> | default (1 KB I$) | 9,924,185 | — | 448,076 | 387,960 |
+> | `LTG_ICACHE_INDEX_BITS=8` (8 KB) | **8,240,847** | **−17.0%** | **255** | **0** |
+>
+> Identical 4,889,053 retired. That is 1.48× the in-order baseline's
+> 12,184,845, up from 1.24×. Note it lands within 0.3% of the 1-cycle-memory
+> bound in §4.1c (8,261,978): on dhrystone the *entire* memory-system cost is
+> I$ capacity misses, and sizing the I$ collects essentially all of it. No
+> non-blocking cache, MSHR or prefetcher is needed to get that 17% — and
+> none of them could get much more.
+
 **The DRIS result is more informative than the cycle count suggests.** The
 stall simply relocated: DRIS-full fell 8,299,935 → 2,373,424 while
 branch-shelf-full rose 1,640,554 → 6,681,203, and the total moved by 9 cycles.
@@ -444,18 +626,49 @@ throughput. It also retires `LTG_BRANCH_SHELF_ENTRIES` as a candidate, since
 the shelf absorbed the pressure without helping.
 
 Three very different configurations landing within 9 cycles of each other
-means something serial dominates spmv that none of these knobs touch. It is
-**not** memory latency — `tb/main_memory.sv` is combinational, with no delay
-model at all.
+means something serial dominates spmv that none of these knobs touch.
+
+> **[CORRECTED 2026-08-15] This paragraph used to end "It is not memory
+> latency — `tb/main_memory.sv` is combinational, with no delay model at
+> all." That is wrong and it misled the §4.1a fix.** `main_memory.sv` is
+> combinational, but the testbench wraps it in a `delay_buffer` with
+> `DELAY = 8` (`tb/testbench.sv:128-138`), and `riscv_core_interface`
+> arbitrates *both* caches onto that single main-memory port
+> (`riscv_core_interface.sv:97-108`). So every fill — I$ as well as D$ —
+> pays 8 cycles, and the two caches contend for the port. The instance is
+> named `DataDelayBuffer` and parameterized with `DMEMORY_READ_DELAY`,
+> which is where the "D-side only" reading came from; it is the shared
+> memory delay. Knobs: `LTG_DMEM_READ_DELAY` (default 8) sets it.
+> `LTG_IMEM_READ_DELAY` / `IMEMORY_READ_DELAY` exists, is imported at
+> `tb/testbench.sv:61`, and is **used nowhere** — a dead knob, not a
+> second delay.
+>
+> The sizing nulls above still stand on their own evidence (evictions
+> moved, misses did not). What does not stand is any inference that memory
+> latency is free on this testbench: it is 8 cycles a fill, on a port the
+> D$ is also trying to use.
 
 ---
 
 ## 5. Open questions
 
-1. **What pins spmv at 15.45M cycles?** Unidentified. The I$, the DRIS and the
-   branch shelf are all ruled out, as is memory latency. Execute width is not
-   it either (integer slots at 15.1% of 4 ways). This is the blocker for
-   Lightning beating the baseline on more than one benchmark.
+1. **What pins spmv at 15.45M cycles?** Unidentified, and now bounded on more
+   sides. The I$, the DRIS and the branch shelf are all ruled out; execute
+   width is not it (integer slots at 15.1% of 4 ways); the memory pipe runs
+   at 0.154 of 1 issue/cycle. **2026-08-15:** I$ misses fell 244,900 → 260
+   with the §4.1b fix and the cycle count moved 78 cycles, and the D$ ceiling
+   is 7.3% (§4.1c) — so the memory hierarchy in total cannot explain a 20%
+   deficit. What remains standing is **intake stall at 8,610,208 cycles, 56%
+   of the run**, with 68% of cycles retiring nothing. The next measurement
+   should target the intake/retire path directly. **§1.3 is the first hard
+   evidence there:** intake reports DRIS-full for 8,299,678 cycles while the
+   valid-entry count is actually at capacity for only 1,534,113 — a 6.8M-cycle
+   gap (44% of the run) in which the DRIS is *not* full but
+   `fetch_ptr − retire_ptr` says it is. Next measurement: count cycles where
+   `branch_fence_valid` holds retirement, and histogram
+   `(fetch_ptr − retire_ptr) − popcount(valid)` — the allocated-but-dead
+   entries. If the fence dominates, the fix is in the shelf/retire path and
+   nothing in the front end will move spmv.
 2. **The kosarajus fetch livelock.** 12 mispredict redirects and a 98% I$ miss
    rate is not a speculation problem; given the spmv null result, a bigger I$
    is unlikely to help. Needs a waveform on the fetch/I$ request path. The
@@ -475,12 +688,35 @@ model at all.
    fill requests reach memory in the whole run, and one block (`main+0x50`,
    the loop epilogue behind a predicted-taken backward branch) is starved for
    the entire run. The cancel fires on correctly predicted control flow, not
-   just mispredicts. Remaining work is the fix, not the diagnosis; `e59a386`
-   on `main` claims it.
+   just mispredicts. ~~Remaining work is the fix, not the diagnosis.~~
+   **Fixed and measured 2026-08-15 (§4.1b): the fix is not a speed-up.**
+   fibi goes to 20 misses and stays at 22.4K cycles; dhrystone reaches its
+   exact ideal miss floor and gets ~1% slower. Closed — but as a cache
+   correctness/instrumentation win, not a performance one.
 6. **Does the same mechanism explain kosarajus?** (open question 2) §4.1a
    predicts yes: run it under `+define+ICACHE_SHADOW` and check whether
    `misses killed by a cancel` dominates there too. Cheap now that the
-   instrument exists.
+   instrument exists. Note §4.1b changes what a "yes" would mean — it would
+   explain the 2.2M miss count without implying the watchdog timeout is
+   caused by it.
+
+7. **Ship the 8 KB I$?** `LTG_ICACHE_INDEX_BITS=8` is −17.0% on dhrystone
+   (§4.2 note) and null on spmv, and takes dhrystone to 1.48× the baseline.
+   It costs 8× the I$ area, which is a real trade on a class-sized design but
+   not obviously a bad one. Needs the other two benchmarks and a decision on
+   whether the default moves.
+
+8. **`LTG_DMEM_READ_DELAY=0` hangs the core.** Zero instructions retired,
+   watchdog timeout (§4.1c). `delay_buffer` documents DELAY=0 as
+   combinational, so either that path is broken or the core cannot accept a
+   same-cycle memory response. Latent, but it blocks the cleanest version of
+   the §4.1c experiment and may indicate a real handshake assumption.
+
+9. **Is `IMEMORY_READ_DELAY` supposed to be wired up?** It is defined
+   (`LTG_IMEM_READ_DELAY`, default 8), imported at `tb/testbench.sv:61`, and
+   used nowhere — the I$ shares `DataDelayBuffer` with the D$. Either wire a
+   second delay buffer on the I-side or delete the knob; right now it reads
+   as an independently tunable I-side latency and is not one.
 
 ## 6. Reproducing
 
