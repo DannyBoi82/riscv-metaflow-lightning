@@ -115,6 +115,7 @@ module InstructionIssueUnit #(
     output logic                      perf_issue_fire
 );
 
+
     logic [XLEN-1:0] pc, next_pc;
 
     always_ff @(posedge clock, negedge reset_n) begin: pc_block_reg
@@ -126,9 +127,9 @@ module InstructionIssueUnit #(
     assign core_req_re   = ~dris_full & ~shelf_full;
 
     // +0, +4, +8, +12
-    logic [XLEN-1:2] block_pc [3:0], block_pc_F1[3:0], block_pc_F2[3:0], block_pc_D[3:0];
-    logic [XLEN-1:2] btb_predicted_pc_block_F1 [3:0], btb_predicted_pc_block_F2 [3:0], btb_predicted_pc_block_D [3:0];
-    logic [XLEN-1:0] btb_best_prediction_F1;
+    logic [XLEN-1:0] block_pc [3:0], block_pc_F1[3:0], block_pc_F2[3:0], block_pc_D[3:0];
+    logic [XLEN-1:0] btb_predicted_pc_block_F1 [3:0], btb_predicted_pc_block_F2 [3:0], btb_predicted_pc_block_D [3:0];
+    logic [XLEN-1:0] btb_best_prediction_F1, btb_best_prediction_F2, btb_best_prediction_D;
     logic [1:0] btb_read_hist_F1 [3:0], btb_read_hist_F2 [3:0], btb_read_hist_D [3:0];
 
     assign block_pc[0] = pc[XLEN-1:0];
@@ -185,22 +186,43 @@ module InstructionIssueUnit #(
             block_pc_F2[2] <= MemorySegments::USER_TEXT_START + 'd8;
             block_pc_F2[3] <= MemorySegments::USER_TEXT_START + 'd12;
             btb_read_hist_F2 <= '0;
+            btb_best_prediction_F2 <= MemorySegments::USER_TEXT_START + 'd4;
         end else if (flush)begin
             block_pc_F2[0] <= {28'd0, pc_mispredict_flush};
             block_pc_F2[1] <= {28'd0, pc_mispredict_flush};
             block_pc_F2[2] <= {28'd0, pc_mispredict_flush};
             block_pc_F2[3] <= {28'd0, pc_mispredict_flush};
             btb_read_hist_F2 <= '0;
+            btb_best_prediction_F2 <= {28'd0, pc_mispredict_flush};
         end else if (~stall_F2) begin
             block_pc_F2 <= block_pc_F1;
             btb_read_hist_F2 <= btb_read_hist_F1;
+            btb_best_prediction_F2 <= btb_best_prediction_F1;
         end
     end
 
     //instuctions show up at end of f2
     logic [XLEN-1:0] fetched_instructions_F2 [FETCH_WORDS-1:0], 
     fetched_instructions_D [FETCH_WORDS-1:0];
+    logic [FETCH_WORDS-1:0] fetched_instructions_valid_F2,
+    fetched_instructions_valid_D;
     assign fetched_instructions_F2 = core_rsp_data;
+
+    int valid_instrs_idx;
+    always_comb begin: valid_instrs_logic
+        fetched_instructions_valid_F2 = '0;
+        for (int w = 0; w < FETCH_WORDS; w++) begin
+
+            //first instruction fetched is instruction of the pc, so
+            //that one should always be valid.
+            if (w == '0) fetched_instructions_valid_F2[w] = 1'b1;
+            else begin
+                //the rest of the instructions are valid
+                // if the pc of the instruction matches the predicted pc of the previous instruction
+                fetched_instructions_valid_F2[w] = block_pc_F2[w] == btb_predicted_pc_block_F2[w-1];
+            end
+        end
+    end : valid_instrs_logic
 
     always_ff @(posedge clock, negedge reset_n) begin: F2_to_DS
         if (~reset_n) begin
@@ -209,18 +231,24 @@ module InstructionIssueUnit #(
             block_pc_D[2] <= MemorySegments::USER_TEXT_START + 'd8;
             block_pc_D[3] <= MemorySegments::USER_TEXT_START + 'd12;
             btb_read_hist_D <= '0;
+            btb_best_prediction_D <= '0;
             fetched_instructions_D <= '0;
+            fetched_instructions_valid_D <= '0;
         end else if (flush)begin
             block_pc_D[0] <= {28'd0, pc_mispredict_flush};
             block_pc_D[1] <= {28'd0, pc_mispredict_flush};
             block_pc_D[2] <= {28'd0, pc_mispredict_flush};
             block_pc_D[3] <= {28'd0, pc_mispredict_flush};
             btb_read_hist_D <= '0;
+            btb_best_prediction_D <= {28'd0, pc_mispredict_flush};
             fetched_instructions_D <= '0;
+            fetched_instructions_valid_D <= '0;
         end else if (~stall_D) begin
             block_pc_D <= block_pc_F2;
             btb_read_hist_D <= btb_read_hist_F2;
+            btb_best_prediction_D <= btb_best_prediction_F2;
             fetched_instructions_D <= fetched_instructions_F2;
+            fetched_instructions_valid_D <= fetched_instructions_valid_F2;
         end
     end
 
@@ -262,17 +290,6 @@ module InstructionIssueUnit #(
     // block_pc_D
     // btb_read_hist_D
     // fetched_instructions_D 
-
-    decoded_instr_t accepted_instrs_D [FETCH_WORDS-1:0];
-    always_comb begin : intake_group_formation
-        accepted_instrs_D    = '0;
-        for (int w = 0; w < FETCH_WORDS; w++) begin
-           if (slot_valid[w]) begin
-                accepted_instrs_D[w] = decoded_instrs_D[w];
-            end
-        end
-
-    end : intake_group_formation
 
 
     /* =================================================================
