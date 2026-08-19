@@ -1,3 +1,9 @@
+//now the iiu looks a lot like the fetch side of my in order core
+//stages:
+//pc, F1, F2 === F1, F2, F3 in the in order core
+//DS is a mixture of the decode stage and the new slot prep thing that has to happen
+//because superscalar
+
 import DRIS_defs::*;
 import RISCV_ISA::*;
 import RISCV_UArch::*;  // Import microarchitecture parameters and definitions
@@ -9,50 +15,52 @@ import internal_defines_pkg::*;     // Control signals struct, ALU ops
 
 `default_nettype none
 
-// shelf_intake_pkt_t and btb_train_pkt_t moved to the DRIS_defs package
-// (rtl/ooo/1DRIS_defs.sv) so BranchShelf.sv, which compiles first, can see
-// them in its port list.
+// shelf_intake_pkt_t and btb_train_pkt_t live in DRIS_defs (rtl/ooo/1DRIS_defs.sv),
+// not here: BranchShelf.sv sorts ahead of this file and needs them in its port list.
+
+typedef struct packed {
+    ctrl_signals_t ctrl_signals;
+    logic [REG_NUM_WIDTH-1:0] rd;
+    logic [REG_NUM_WIDTH-1:0] rs1;
+    logic [REG_NUM_WIDTH-1:0] rs2;
+    logic [XLEN-1:0] imm;
+} decoded_instr_t;
 
 /**
  * InstructionIssueUnit (IIU) — fetch/decode/issue front end + branch shelf.
  *
- * Branch execution model (TODO-IIU.md Phase 0, deviation from Lightning):
- * control transfers dispatch through the Scheduler/ALUs like any other
- * instruction. The exec way's writeback carries two values: result_data_W
- * is always the register-file-bound value (the pc+4 link for JAL/JALR),
- * and next_pc_W is the computed next PC, consumed only by the shelf's
- * snoop. The shelf verifies next_pc_W against the predicted PC and never
- * writes the DRIS — the exec ways are the sole producers of register-
- * file-bound data, the IIU the sole owner of the PC. The branch fence
- * holds retirement until the shelf resolves.
+ * Structurally this is the in-order core's fetch side (riscv_core.sv,
+ * F1->F2->F3->D) widened to FETCH_WORDS. Stages are pc -> F1 -> F2 -> D, and
+ * groups in flight are tracked *positionally*: F2 is the response stage, so a
+ * request accepted at cycle N sits in block_pc_F2 at N+2, which is exactly the
+ * cycle its response reaches the controller's FIFO head. Nothing counts
+ * outstanding requests; the stall table below is what keeps position honest,
+ * and the assertion at the bottom is what catches it if it ever isn't.
  *
- * Prediction: the oldest CT in a group owns the BTB's single read port.
- * JAL computes its target at decode (never mispredicts); a branch/JALR
- * keys the BTB with its own PC and takes the predicted next PC. Younger
- * CTs in the same group (possible only behind a not-taken-predicted
- * branch) get static predictions: conditional branches predict
- * fall-through, JAL computes exactly, and a younger JALR ends the group
- * before itself — pc+4 for a JALR is a guaranteed mispredict, so it
- * refetches as the oldest CT of the next group and gets a real lookup.
- * The shelf trains the BTB with one resolved branch/JALR per cycle.
+ * Wrong-path groups are killed with the in-order core's PC-tag trick: a flush
+ * stamps WPC_FLUSH into every stage, a stall bubble stamps WPC_BUBBLE into F2,
+ * and the D stage drops any group whose PC is tagged before it reaches the
+ * DRIS. Reset stamps a bubble too, which is what covers startup.
+ *
+ * Prediction: BTBPredictor4 gives every slot of the group its own lookup, so
+ * group shape falls out of the predictions alone — slot w is valid iff its PC
+ * is what slot w-1 predicted. There are no decode-stage cuts. A JAL or JALR
+ * whose BTB entry is cold mispredicts once, the shelf resolves it and trains
+ * the exact target, and it predicts correctly from then on. The only redirect
+ * sources are trap_valid and the shelf's mispredict_valid.
  *
  * Talks to the I-side cache_controller2 (FETCH_WORDS-widened) over the
- * core_req / core_rsp seam:
+ * core_req / core_rsp seam, whose protocol is "same seam and timing as
+ * cache_controller_ref" (cache_controller2.sv:4) — which is what lets the
+ * in-order core's stall recipe carry over unchanged:
  *   - a request presented while core_rsp_ready=1 is accepted that cycle;
- *   - responses (up to FETCH_WORDS words + their address) pop from the
- *     controller FIFO; core_req_stall_mem holds the FIFO head while intake
- *     is stalled (DRIS full / shelf full), so the controller doubles as the
- *     skid buffer;
+ *   - core_req_stall_mem (the FIFO's peek_only) holds the response head while
+ *     the front end is stalled;
  *   - core_req_cancel drops in-flight probes and queued responses, and is
- *     raised *only* on a mispredict repair. A CT cut or a trap redirects
- *     the PC without touching the cache; the F-queue below tracks the
- *     outstanding requests and squashes those wrong-path responses when
- *     they arrive, so a redirect no longer throws away a cache line.
+ *     raised only on a mispredict repair.
  *
- * Issue groups are prefix-contiguous: a group ends at the block boundary
- * (controller clamp), right after the first *redirecting* CT (JAL or
- * predicted-taken branch/JALR), or right before a younger JALR, so slot w
- * always gets DRIS ID fetch_ptr + w. Short groups are holes, never noops.
+ * Issue groups are prefix-contiguous, so slot w always gets DRIS ID
+ * fetch_ptr + w. Short groups are holes, never noops.
  */
 module InstructionIssueUnit #(
     parameter int FETCH_WORDS       = DRIS_defs::FETCH_WAYS,
@@ -119,16 +127,32 @@ module InstructionIssueUnit #(
     output logic                      perf_mispredict_valid,
     // Front-end blocking: intake stalled, and why. The two reasons are
     // reported raw (they can both be true in the same cycle).
-    output logic                      perf_intake_stall,
+    output logic                      perf_stall_pc,
     output logic                      perf_stall_dris_full,
     output logic                      perf_stall_shelf_full,
     // A fetch group was accepted into the DRIS this cycle.
     output logic                      perf_issue_fire
 );
 
+    // A group can present at most FETCH_WORDS control transfers, and the
+    // intake stall reserves that many shelf entries up front (see stall_logic).
+    // If the shelf is smaller than a group the stall can never be satisfied and
+    // the front end wedges — the failure mode commit d434d13 hit.
+    initial begin
+        if (DRIS_defs::BRANCH_SHELF_ENTRIES < FETCH_WORDS)
+            $fatal(1, "%m: BRANCH_SHELF_ENTRIES (%0d) < FETCH_WORDS (%0d)",
+                   DRIS_defs::BRANCH_SHELF_ENTRIES, FETCH_WORDS);
+    end
+
     /* =================================================================
-     * Forward declarations (redirect network)
+     * Forward declarations
      * ================================================================= */
+    logic                       stall_pc, stall_F1, stall_F2, stall_D;
+    logic                       instr_stall, flush;
+    logic                       dris_full, shelf_full;
+    logic                       issue_fire;
+    logic [$clog2(FETCH_WORDS+1)-1:0] group_count;
+
     logic                       mispredict_valid;
     logic [XLEN-1:0]            mispredict_pc;
     dris_id_t                   mispredict_branch_id;
@@ -136,447 +160,255 @@ module InstructionIssueUnit #(
     logic [FETCH_WORDS-1:0]     shelf_alloc_valid;
     shelf_intake_pkt_t [FETCH_WORDS-1:0] shelf_in_pkt;
     btb_train_pkt_t             btb_train;
-    logic [XLEN-1:0]            btb_predicted_pc;
-    logic [1:0]                 btb_read_hist;
-
-    logic            redirect, ct_redirect;
-    logic [XLEN-1:0] redirect_pc, ct_resume_pc;
-    logic            intake_stall;
+    ctrl_signals_t              btb_write_ctrl;
 
     /* =================================================================
-     * Fetch request / PC maintenance
+     * Wrong-path / bubble PC tags.
+     *
+     * Same trick as the in-order core (pc_mispredict_flush / pc_stall_bubble
+     * in internal_defines_pkg), but the block_pc pipeline carries *word*
+     * addresses and pc_mispredict_flush is odd, so it cannot survive a
+     * byte->word narrowing. These are the word-address equivalents: byte
+     * 0x2C and 0x34, far below USER_TEXT_START (0x0040_0000), so neither can
+     * ever collide with a real fetch address.
      * ================================================================= */
-    logic [XLEN-1:0] pc_F;   // byte address of the next fetch request
-    logic [XLEN-1:0] next_pc;
+    localparam logic [XLEN-1:2] WPC_FLUSH  = (XLEN-2)'(pc_mispredict_flush);
+    localparam logic [XLEN-1:2] WPC_BUBBLE = (XLEN-2)'(pc_stall_bubble);
 
-    // Real backpressure, not just a hold on the response head.
-    // core_req_stall_mem (peek_only) keeps the FIFO's *head* in place, but it
-    // does not stop the controller: on a hit it enqueues a response and chains
-    // the next probe every cycle. The response FIFO is 2 deep and drops
-    // enqueues silently when full, so a stall lasting more than two cycles
-    // vaporized whole fetch groups whose PCs pc_F had already marched past —
-    // instructions that were never refetched (memtest2 lost 0x4000a0-0x4000ac
-    // outright). Dropping the request while stalled bounds the outstanding
-    // work at one held head + one in-flight probe = exactly the FIFO's depth.
-    assign core_req_re     = !intake_stall;
-    assign core_req_addr   = pc_F[2 +: ADDRESS_SIZE];
-    /* Cancel on a mispredict only — never on a CT cut or a trap.
+    function automatic logic tagged(input logic [XLEN-1:2] wpc);
+        return (wpc == WPC_FLUSH) || (wpc == WPC_BUBBLE);
+    endfunction
+
+    logic [XLEN-1:0] pc, next_pc;
+
+    always_ff @(posedge clock, negedge reset_n) begin: pc_block_reg
+        if (~reset_n) pc <= MemorySegments::USER_TEXT_START;
+        else if (~stall_pc | flush) pc <= next_pc;
+    end
+
+    assign core_req_addr = pc[ADDRESS_SIZE+1:2];
+    assign core_req_re   = ~dris_full & ~shelf_full;
+
+    /* Cancel on a mispredict only.
      *
-     * This used to be `redirect`, which includes ct_redirect: a cut fires on
-     * every JAL and every predicted-taken branch, i.e. on *correctly*
-     * predicted control flow, so fibi raised 5,826 cancels against 793
-     * mispredicts. Because the controller chains a new probe out of every
-     * response cycle, the redirect a group produces lands exactly on the
-     * cycle the next probe's miss resolves, and the cancel override
-     * (cache_controller2.sv:363-370) clears mem_bus_request in the same
-     * block that a read_miss sets it. The fill was therefore never even
-     * requested: 858 I$ misses, 19 fill requests, and one block behind a
-     * backward branch (main+0x50) probed 841 times and never installed.
-     * 839 of the 858 died this way. See docs/perf-counters.md §4.1a.
+     * This used to be every redirect, which included the per-group control
+     * transfer cut — one on every JAL and every predicted-taken branch, i.e. on
+     * *correctly* predicted control flow. Because the controller chains a new
+     * probe out of every response cycle, that cancel landed exactly on the cycle
+     * the next probe's miss resolved and cleared mem_bus_request in the same
+     * block a read_miss sets it (cache_controller2.sv:363-370), so the fill was
+     * never requested: fibi took 858 I$ misses for 19 fill requests. See
+     * docs/perf-counters.md §4.1a and commit b3855c5.
      *
-     * A mispredict is rare (793 vs 5,826) and is genuinely wrong-path work,
-     * so cancelling there keeps the bandwidth saving without the pathology.
-     * Everything else redirects the PC and lets the wrong-path responses
-     * arrive, where the F-queue below drops them.
-     *
-     * Note this is *not* free of the same cost in miniature: a mispredict
-     * cancel still abandons an in-flight fill (7 of fibi's 858). Tying this
-     * to 1'b0 would recover those too, at the price of waiting out a
-     * wrong-path fill — cheap only because tb/main_memory.sv is
-     * combinational. Revisit if main memory ever gets a delay model. */
+     * There is no control-transfer cut left in this design at all, so this is
+     * now the only cancel source. Everything else redirects the PC and lets the
+     * wrong-path responses arrive, where the tag check at D drops them. */
     assign core_req_cancel = mispredict_valid;
 
-    // Sequential next fetch: past everything this request will return
-    // (the controller clamps the group at the block boundary).
-    // pc_F[2 +: BLOCK_OFFSET_BITS] is the word index within the cache block
-    // (indexed part-select: variable base, constant width).
-    int              words_left, grab;
-    logic [XLEN-1:0] seq_next_fetch;
-    always_comb begin : seq_fetch
-        words_left     = BLOCK_SIZE - int'(pc_F[2 +: BLOCK_OFFSET_BITS]);
-        grab           = (words_left < FETCH_WORDS) ? words_left : FETCH_WORDS;
-        seq_next_fetch = pc_F + XLEN'(4 * grab);
-    end : seq_fetch
+    // +0, +4, +8, +12 as WORD addresses — BTBPredictor4's read port is
+    // [XLEN-1:2], and so is the predicted_pc_block it returns.
+    logic [XLEN-1:2] block_pc [FETCH_WORDS-1:0];
+    logic [XLEN-1:2] block_pc_F1 [FETCH_WORDS-1:0],
+                     block_pc_F2 [FETCH_WORDS-1:0],
+                     block_pc_D  [FETCH_WORDS-1:0];
 
-    // Redirect must win over the stall hold: mispredict_valid is a one-cycle
-    // pulse and core_rsp_ready can be low while the controller works a miss,
-    // so "hold while stalled" alone would drop the repair PC.
-    // core_rsp_ready alone is not "accepted": the controller holds ready high
-    // in states where it would take a request, so pc_F must also see that we
-    // actually made one (core_req_re) — otherwise a stalled cycle silently
-    // skips a group's worth of PCs.
-    always_comb begin : next_pc_mux
-        if (redirect)                            next_pc = redirect_pc;
-        else if (core_rsp_ready && core_req_re)  next_pc = seq_next_fetch;
-        else                                     next_pc = pc_F;  // hold
-    end : next_pc_mux
+    // The BTB read is combinational off the PC stage; these are its PC-stage
+    // outputs, and the _F1/_F2/_D copies below ride the same three registers
+    // block_pc does, so a slot's prediction stays with its own PC. (Riding one
+    // register fewer would pair every group with the next group's predictions.)
+    logic [XLEN-1:2] btb_pred_pc_block [FETCH_WORDS-1:0];
+    logic [1:0]      btb_read_hist [FETCH_WORDS-1:0];
+    logic [XLEN-1:0] btb_best_prediction;
 
-    always_ff @(posedge clock, negedge reset_n) begin : pc_reg
-        if (!reset_n) pc_F <= MemorySegments::USER_TEXT_START;
-        else          pc_F <= next_pc;
-    end : pc_reg
+    logic [XLEN-1:2] btb_pred_pc_block_F1 [FETCH_WORDS-1:0],
+                     btb_pred_pc_block_F2 [FETCH_WORDS-1:0],
+                     btb_pred_pc_block_D  [FETCH_WORDS-1:0];
+    logic [1:0]      btb_read_hist_F1 [FETCH_WORDS-1:0],
+                     btb_read_hist_F2 [FETCH_WORDS-1:0],
+                     btb_read_hist_D  [FETCH_WORDS-1:0];
 
-    /* =================================================================
-     * F-queue — outstanding fetch requests (F1/F2)
-     *
-     * The core tracks what it has asked the I-side controller for, so a
-     * redirect can squash wrong-path *responses on arrival* instead of
-     * killing the request at the source. Without this, dropping
-     * ct_redirect from core_req_cancel is not merely a perf change — it is
-     * wrong: the sequential fetches past a predicted-taken branch would
-     * still arrive at the FIFO head, and slot_valid (which keys off
-     * core_rsp_data_valid alone) would write them into the DRIS as
-     * architectural instructions.
-     *
-     * Two entries, because at most two requests are outstanding: accept at
-     * cycle N -> the probe resolves and enqueues at N+1 -> the response is
-     * visible at the (registered) FIFO head at N+2. f1 is the younger entry
-     * (just accepted, probing); f2 is the older, whose response arrives
-     * next. This mirrors the controller's own 2-deep response FIFO.
-     *
-     * It rests on: every accepted I-side request produces exactly one
-     * response, in order. core_req_we is tied low on this side, so every
-     * accepted request walks IDLE -> READ_CACHE_RSP -> (hit | fill) and
-     * enqueues exactly once. A cancel is the sole exception, and it voids
-     * *all* of them at once (see below). The assertions are what hold that
-     * invariant honest — a tracking desync silently drops instructions,
-     * which is the failure mode that already cost this repo memtest2's
-     * 0x4000a0-0x4000ac (see the core_req_re comment above).
-     *
-     * f2.addr is read only by assertion 1: slot_pc, avail and the CT cut
-     * all derive from core_rsp_addr and must keep doing so.
-     *
-     * Two bits per entry, not one. `busy` is occupancy — a response is
-     * still owed for this request — and `good` is whether it is still on
-     * the fetch path. A CT cut or trap clears `good` and leaves `busy`
-     * alone, because nothing cancelled the cache and the wrong-path
-     * response is still coming; the queue has to be there to receive it.
-     * Folding the two into a single valid bit drops occupancy on the
-     * redirect, and the next wrong-path response then arrives untracked.
-     * ================================================================= */
-    typedef struct packed {
-        logic                    busy;   // a response is still owed
-        logic                    good;   // ...and it is on the current path
-        logic [ADDRESS_SIZE-1:0] addr;
-    } fetch_track_t;
+    always_comb begin : block_pc_gen
+        for (int w = 0; w < FETCH_WORDS; w++)
+            block_pc[w] = pc[XLEN-1:2] + (XLEN-2)'(w);
+    end : block_pc_gen
 
-    fetch_track_t f1, f2, f1_n, f2_n;
-
-    // The two enables, and they move independently — that is the whole
-    // point. cache_controller2 chains a new probe out of READ_CACHE_RSP and
-    // READ_WAIT_MEM_RSP, so accept and consume do not travel together the
-    // way the in-order core's fixed F1/F2/F3 shift register assumes:
-    //   hit at N, chained probe misses at N+1 : consume, no accept
-    //   fill completes (do_forward + ready=1) : accept, no consume
-    //   intake stalled                        : neither
-    //   steady-state hits                     : both
-    //
-    // core_rsp_ready is *not* suppressed by the cancel override in
-    // FSM_outputs (cache_issue_read is), so the !core_req_cancel term is
-    // load-bearing: without it a cancel cycle would record a request the
-    // controller never took.
-    logic accept, consume;
-    assign accept  = core_req_re && core_rsp_ready && !core_req_cancel;
-    // The FIFO's actual dequeue condition: num_deq is hardwired to 1 and
-    // peek_only is core_req_stall_mem (= intake_stall), so the head pops
-    // every cycle it is valid and intake is not stalling.
-    assign consume = core_rsp_data_valid && !intake_stall;
-
-    logic ftrack_overrun;   // accept into an already-occupied F1 (assertion 2)
-
-    always_comb begin : fetch_track_next
-        f1_n = f1;
-        f2_n = f2;
-
-        // F2 frees when the response it was owed is taken.
-        if (consume) f2_n = '0;
-
-        // F1 slides into a free F2.
-        if (!f2_n.busy) begin
-            f2_n = f1;
-            f1_n = '0;
+    always_ff @(posedge clock, negedge reset_n) begin: PCtoF1
+        if (~reset_n | flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_F1[w]          <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                btb_pred_pc_block_F1[w] <= '0;
+                btb_read_hist_F1[w]     <= '0;
+            end
+        end else if (~stall_F1) begin
+            block_pc_F1          <= block_pc;
+            btb_pred_pc_block_F1 <= btb_pred_pc_block;
+            btb_read_hist_F1     <= btb_read_hist;
         end
+    end
 
-        // Nothing may land on top of a request that has not slid out yet;
-        // core_req_re = !intake_stall and peek_only = intake_stall suppress
-        // accept and consume together, which is what makes this impossible.
-        ftrack_overrun = accept && f1_n.busy;
+    //this is now only being used to predict the next block to fetch, not
+    //the actual pc itself
+    BTBPredictor4 btb (
+        .clk                       (clock),
+        .rst_l                     (reset_n),
+        .block_pc                  (block_pc), //needs to do rotation internally
+        .predicted_pc_block        (btb_pred_pc_block),
+        .best_prediction           (btb_best_prediction), //the pc most likely to
+        //be fetched next, straight to the pc (the i cache)
+        .read_btb_hist             (btb_read_hist), //this is also a vector now
+        .taken_branch              (),
+        .btb_hit                   (),
 
-        // A newly accepted request lands in F1.
-        if (accept) f1_n = '{busy: 1'b1, good: 1'b1, addr: core_req_addr};
+        // only one write port because the branch shelf
+        //resolves one branch per cycle
+        .bcond_write               (btb_train.taken),
+        .ctrl_signals_write        (btb_write_ctrl),
+        .correct_branch_prediction (btb_train.correct),
+        .pc_write                  (btb_train.pc),
+        .npc_offset_write          (btb_train.next_pc),
+        .write_btb_hist            (btb_train.hist)
+    );
 
-        // A redirect marks everything in flight wrong-path — including the
-        // request accepted THIS cycle, since pc_F is still on the sequential
-        // path in the cycle the redirect is computed, so this has to come
-        // after the accept above. `busy` is untouched: those responses are
-        // still on their way and still have to be consumed.
-        if (redirect) begin
-            f1_n.good = 1'b0;
-            f2_n.good = 1'b0;
+    // CTRL_SIGNALS_NOOP's PC_plus4 holds BTBPredictor4's internal write enable
+    // off between training packets.
+    assign btb_write_ctrl = btb_train.valid ? btb_train.ctrl_signals
+                                            : CTRL_SIGNALS_NOOP;
+
+    assign next_pc = trap_valid       ? trap_pc
+                   : mispredict_valid ? mispredict_pc
+                                      : btb_best_prediction;
+
+    always_ff @(posedge clock, negedge reset_n) begin: F1_to_F2
+        if (~reset_n | flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_F2[w]          <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                btb_pred_pc_block_F2[w] <= '0;
+                btb_read_hist_F2[w]     <= '0;
+            end
+        end else if (~stall_F2 & stall_F1) begin
+            // F2 is draining but F1 is frozen. Insert a bubble so the same
+            // fetch group is not re-latched out of the held F1 register — it
+            // would be written to the DRIS twice. The controller is holding
+            // its response head for exactly this cycle (peek_only =
+            // instr_stall), so the bubble is also what keeps the number of
+            // FIFO pops equal to the number of real groups latched at D.
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_F2[w]          <= WPC_BUBBLE;
+                btb_pred_pc_block_F2[w] <= '0;
+                btb_read_hist_F2[w]     <= '0;
+            end
+        end else if (~stall_F2) begin
+            block_pc_F2          <= block_pc_F1;
+            btb_pred_pc_block_F2 <= btb_pred_pc_block_F1;
+            btb_read_hist_F2     <= btb_read_hist_F1;
         end
+    end
 
-        // ...unless this redirect is the one that cancels. The cancel
-        // flushes the controller's response FIFO wholesale
-        // (cache_controller2.sv:504), forces next_state to IDLE (:251) and
-        // suppresses the enqueue strobes (:370), so every outstanding
-        // request is voided and no response is owed for any of them. Clear
-        // occupancy, not just the path bit — leaving `busy` set here would
-        // strand the queue full and trip assertion 2 on the refetch.
-        // Ordering: cancel implies redirect, so this must come last.
-        if (core_req_cancel) begin
-            f1_n = '0;
-            f2_n = '0;
+    //instuctions show up at end of f2
+    logic [XLEN-1:0] fetched_instructions_D [FETCH_WORDS-1:0];
+    logic [FETCH_WORDS-1:0] fetched_instructions_valid_F2,
+    fetched_instructions_valid_D;
+
+    always_comb begin: valid_instrs_logic
+        fetched_instructions_valid_F2 = '0;
+        for (int w = 0; w < FETCH_WORDS; w++) begin
+
+            //first instruction fetched is instruction of the pc, so
+            //that one is valid whenever a response is actually here.
+            if (w == '0) fetched_instructions_valid_F2[w] = core_rsp_data_valid;
+            else begin
+                //the rest of the instructions are valid
+                // if the pc of the instruction matches the predicted pc of the previous instruction
+                fetched_instructions_valid_F2[w] =
+                    // validity has to be a PREFIX: slot w's DRIS ID is
+                    // fetch_ptr + w, so a hole would shift every younger
+                    // slot's ID off its own instruction.
+                    fetched_instructions_valid_F2[w-1] &&
+                    (block_pc_F2[w] == btb_pred_pc_block_F2[w-1]) &&
+                    // ...and slot w has to still be inside slot 0's cache
+                    // block. The chain cannot see the block boundary by
+                    // itself: an out-of-block slot is forced to miss in the
+                    // BTB (in_group), so it predicts fall-through, and
+                    // block_pc[w+1] == block_pc[w]+1 always holds. Meanwhile
+                    // cache3.sv:486 fills read_data[word] only while
+                    // block_offset + word < BLOCK_SIZE, so the slots past the
+                    // boundary are zero words. A group is at most BLOCK_SIZE
+                    // words, so a block offset of 0 at any w > 0 is the wrap.
+                    (block_pc_F2[w][BLOCK_OFFSET_BITS+1:2] != '0);
+            end
         end
-    end : fetch_track_next
+    end : valid_instrs_logic
 
-    always_ff @(posedge clock, negedge reset_n) begin : fetch_track
-        if (!reset_n) begin
-            f1 <= '0;
-            f2 <= '0;
+    always_ff @(posedge clock, negedge reset_n) begin: F2_to_DS
+        if (~reset_n | flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_D[w]           <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                btb_pred_pc_block_D[w]  <= '0;
+                btb_read_hist_D[w]      <= '0;
+                fetched_instructions_D[w] <= '0;
+            end
+            fetched_instructions_valid_D <= '0;
+        end else if (~stall_D) begin
+            block_pc_D          <= block_pc_F2;
+            btb_pred_pc_block_D <= btb_pred_pc_block_F2;
+            btb_read_hist_D     <= btb_read_hist_F2;
+            for (int w = 0; w < FETCH_WORDS; w++)
+                fetched_instructions_D[w] <= core_rsp_data[w];
+            fetched_instructions_valid_D  <= fetched_instructions_valid_F2;
         end
-        else begin
-            f1 <= f1_n;
-            f2 <= f2_n;
-        end
-    end : fetch_track
-
-    // synopsys translate_off
-    // Fatal, not $error: a desync means a GOOD group is about to be dropped
-    // while pc_F has already run past it. That must crash the run, not show
-    // up as a register mismatch dozens of instructions later.
-    // The `$time > 0` guard is not decoration: the testbench's clk starts at
-    // 1, so its initialization counts as a posedge at time 0 in a 4-state
-    // simulator, and reset_n is still high there (it only pulses low at t=1).
-    // Everything below is X on that edge. The repo's other assertions only
-    // $display and survive it; these are $fatal and would not.
-    always_ff @(posedge clock) begin : fetch_track_assertions
-        if ((reset_n === 1'b1) && ($time > 0)) begin
-            // 1. The model matches reality. Once the invariant above holds
-            //    this is tautological — so if it fires, the model is broken.
-            assert (!(core_rsp_data_valid && f2.busy) ||
-                    (core_rsp_addr == f2.addr))
-            else $fatal(1, "%0t %m: fetch tracking desync - rsp=%h f2=%h",
-                        $time, {core_rsp_addr, 2'b00}, {f2.addr, 2'b00});
-
-            // 2. Never accept into an occupied F1 (would lose a request).
-            assert (!ftrack_overrun)
-            else $fatal(1, "%0t %m: accepted a request with the F-queue full",
-                        $time);
-
-            // 3. A response with nothing outstanding. Also the check that
-            //    the cancel really does void every outstanding request: if
-            //    the FIFO flush ever left one behind, it lands here.
-            assert (!(core_rsp_data_valid && !f1.busy && !f2.busy))
-            else $fatal(1, "%0t %m: response with an empty F-queue", $time);
-        end
-    end : fetch_track_assertions
-    // synopsys translate_on
+    end
 
     /* =================================================================
      * Per-slot decode
      * ================================================================= */
-    ctrl_signals_t            slot_ctrl [FETCH_WORDS-1:0];
-    logic [REG_NUM_WIDTH-1:0] slot_rd   [FETCH_WORDS-1:0];
-    logic [REG_NUM_WIDTH-1:0] slot_rs1  [FETCH_WORDS-1:0];
-    logic [REG_NUM_WIDTH-1:0] slot_rs2  [FETCH_WORDS-1:0];
-    logic [XLEN-1:0]          slot_imm  [FETCH_WORDS-1:0];
+    decoded_instr_t decoded_instrs_D [FETCH_WORDS-1:0];
 
     generate
         for (genvar w = 0; w < FETCH_WORDS; w++) begin : slot_decode
             riscv_decode dec (
                 .rst_l        (reset_n),
-                .instr        (core_rsp_data[w]),
-                .ctrl_signals (slot_ctrl[w]),
-                .rd           (slot_rd[w]),
-                .rs1          (slot_rs1[w]),
-                .rs2          (slot_rs2[w])
+                .instr        (fetched_instructions_D[w]),
+                .ctrl_signals (decoded_instrs_D[w].ctrl_signals),
+                .rd           (decoded_instrs_D[w].rd),
+                .rs1          (decoded_instrs_D[w].rs1),
+                .rs2          (decoded_instrs_D[w].rs2)
             );
             ImmediateGenerator ig (
-                .instr     (core_rsp_data[w]),
-                .imm_mode  (slot_ctrl[w].imm_mode),
-                .immediate (slot_imm[w])
+                .instr     (fetched_instructions_D[w]),
+                .imm_mode  (decoded_instrs_D[w].ctrl_signals.imm_mode),
+                .immediate (decoded_instrs_D[w].imm)
             );
         end : slot_decode
     endgenerate
 
     /* =================================================================
-     * Group formation
+     * Group formation at D.
      *
-     * Validity is prefix-contiguous: the block-boundary clamp (from the
-     * response address), the cut after the first redirecting CT, and
-     * the cut before a younger JALR all truncate a prefix, so slot w's
-     * DRIS ID is fetch_ptr + w.
-     *
-     * Per-slot next-PC prediction (ct = control transfer):
-     *   - oldest CT, branch/JALR: BTB keyed on the slot's own PC
-     *   - JAL anywhere: pc + imm, exact at decode (always redirects,
-     *     because fetch already ran sequentially past it)
-     *   - younger branch: static not-taken (pc + 4), group continues
-     *   - younger JALR: cut the group *before* it; pc+4 would be a
-     *     guaranteed mispredict, so refetch it as oldest of next group
-     *
-     * A group also never carries more CTs than the branch shelf can hold
-     * (CT_PER_GROUP_MAX); the intake stall below waits for *free* shelf
-     * entries, and it can only ever be satisfied if the demand fits the
-     * shelf's capacity in the first place.
+     * Group *shape* was already decided by the prediction chain at F2 and
+     * rode the register down here. All that is left is to drop the group
+     * outright if its PC is a wrong-path or bubble tag — flush, stall bubble,
+     * or reset. All FETCH_WORDS entries carry the same tag, so testing slot 0
+     * covers the group.
      * ================================================================= */
-    // Shelf capacity, clamped to the group width (a group can't hold more
-    // CTs than it has slots).
-    localparam int CT_PER_GROUP_MAX =
-        (DRIS_defs::BRANCH_SHELF_ENTRIES < FETCH_WORDS)
-            ? DRIS_defs::BRANCH_SHELF_ENTRIES : FETCH_WORDS;
-    logic [FETCH_WORDS-1:0] slot_valid;
-    logic [FETCH_WORDS-1:0] slot_is_ct;
-    logic [XLEN-1:0]        slot_pc      [FETCH_WORDS-1:0];
-    logic [XLEN-1:0]        slot_pred_pc [FETCH_WORDS-1:0];
-    logic                   group_has_ct;
-    int                     avail;      // words before the block boundary
-    logic                   cut;        // group truncated at/after this slot
-    logic [$clog2(FETCH_WORDS+1)-1:0] ct_count;  // CTs needing shelf entries
-    logic                   ct_redirect_pend;  // group leaves the seq path
-    int                     primary_ct_slot;   // oldest CT: owns the BTB port
-    logic                   primary_ct_found;
+    logic [FETCH_WORDS-1:0] slot_valid, slot_is_ct;
+    logic                   group_tagged;
 
-    always_comb begin : slot_prep
-        avail = BLOCK_SIZE - int'(core_rsp_addr[BLOCK_OFFSET_BITS-1:0]);
-        for (int w = 0; w < FETCH_WORDS; w++) begin
-            slot_pc[w]    = {core_rsp_addr, 2'b00} + XLEN'(4 * w);
-            slot_is_ct[w] = slot_ctrl[w].pc_source != PC_plus4;
-        end
-    end : slot_prep
+    assign group_tagged = tagged(block_pc_D[0]);
+    assign slot_valid   = fetched_instructions_valid_D &
+                          {FETCH_WORDS{~group_tagged}};
 
-    // Oldest CT of the group, found without reference to the BTB output
-    // (no cut can precede the first CT, so position + clamp suffice).
-    always_comb begin : primary_ct
-        primary_ct_slot  = 0;
-        primary_ct_found = 1'b0;
-        for (int w = 0; w < FETCH_WORDS; w++) begin
-            if (!primary_ct_found && core_rsp_data_valid &&
-                (w < avail) && slot_is_ct[w]) begin
-                primary_ct_slot  = w;
-                primary_ct_found = 1'b1;
-            end
-        end
-    end : primary_ct
+    always_comb begin : slot_ct_logic
+        for (int w = 0; w < FETCH_WORDS; w++)
+            slot_is_ct[w] = decoded_instrs_D[w].ctrl_signals.pc_source != PC_plus4;
+    end : slot_ct_logic
 
-    always_comb begin : group_formation
-        cut              = 1'b0;
-        group_has_ct     = 1'b0;
-        ct_count         = '0;
-        ct_redirect_pend = 1'b0;
-        ct_resume_pc     = '0;
-        for (int w = 0; w < FETCH_WORDS; w++) begin
-            slot_valid[w]   = core_rsp_data_valid && !cut && (w < avail);
-            slot_pred_pc[w] = slot_pc[w] + XLEN'(4);
-            if (slot_valid[w] && slot_is_ct[w]) begin
-                if (int'(ct_count) >= CT_PER_GROUP_MAX) begin
-                    // Shelf capacity reached: end the group before this CT
-                    // and refetch it as the oldest CT of the next group
-                    // (same treatment as a younger JALR). Bounding the
-                    // group by the shelf's *capacity* is what keeps the
-                    // shelf_room stall satisfiable — a group demanding more
-                    // entries than the shelf can ever hold would stall for
-                    // ever. CT_PER_GROUP_MAX >= 1, so at least the oldest
-                    // CT is always taken and the group is never empty.
-                    slot_valid[w]    = 1'b0;
-                    cut              = 1'b1;
-                    ct_redirect_pend = 1'b1;
-                    ct_resume_pc     = slot_pc[w];
-                end else if (slot_ctrl[w].pc_source == PC_uncond) begin
-                    // JAL: exact target; fetch ran past it, so always cut
-                    slot_pred_pc[w]  = slot_pc[w] + slot_imm[w];
-                    group_has_ct     = 1'b1;
-                    ct_count        += 1'b1;
-                    cut              = 1'b1;
-                    ct_redirect_pend = 1'b1;
-                    ct_resume_pc     = slot_pred_pc[w];
-                end else if (!group_has_ct) begin
-                    // oldest CT, branch/JALR: BTB prediction
-                    slot_pred_pc[w] = btb_predicted_pc;
-                    group_has_ct    = 1'b1;
-                    ct_count       += 1'b1;
-                    if (btb_predicted_pc != slot_pc[w] + XLEN'(4)) begin
-                        cut              = 1'b1;  // predicted taken
-                        ct_redirect_pend = 1'b1;
-                        ct_resume_pc     = btb_predicted_pc;
-                    end
-                end else if (slot_ctrl[w].pc_source == PC_indirect) begin
-                    // younger JALR: end the group before it
-                    slot_valid[w]    = 1'b0;
-                    cut              = 1'b1;
-                    ct_redirect_pend = 1'b1;
-                    ct_resume_pc     = slot_pc[w];
-                end else begin
-                    // younger conditional branch: static not-taken
-                    group_has_ct = 1'b1;
-                    ct_count    += 1'b1;
-                end
-            end
-        end
-    end : group_formation
-
-    logic [$clog2(FETCH_WORDS+1)-1:0] group_count;
-    always_comb begin
+    always_comb begin : group_count_logic
         group_count = '0;
         for (int w = 0; w < FETCH_WORDS; w++)
             group_count += slot_valid[w] ? 1'b1 : 1'b0;
-    end
+    end : group_count_logic
 
-    /* =================================================================
-     * Intake stall + issue fire
-     *
-     * The only legal issue stalls (Metaflow Arch p.64): DRIS full and,
-     * in this design, too few free branch-shelf entries for the group's
-     * CTs. A stall asserts core_req_stall_mem so the controller FIFO
-     * holds the response until there's room.
-     * ================================================================= */
-    logic [DRIS_ID_WIDTH:0] occupancy;
-    assign occupancy = fetch_ptr - retire_ptr;  // color-bit MSB makes this mod-2N
-
-    logic dris_room, shelf_room, issue_fire;  // intake_stall declared above
-    assign dris_room    = (DRIS_NUM_ENTRIES - int'(occupancy)) >= int'(group_count);
-    assign shelf_room   = int'(shelf_free_count) >= int'(ct_count);
-    /* f2.good here as well as in issue_fire: a squashed group needs neither
-     * a DRIS entry nor a shelf entry, so it must not be held at the FIFO
-     * head when those are full. Without this term a stale wrong-path head
-     * blocks the redirect target's fetch until retirement drains the DRIS —
-     * not a deadlock (retirement is independent of fetch), but wasted
-     * cycles for nothing. */
-    assign intake_stall = core_rsp_data_valid && f2.good &&
-                          (!dris_room || !shelf_room);
-    assign core_req_stall_mem = intake_stall;
-
-    /* f2.good is the wrong-path squash: a CT cut or a trap no longer
-     * cancels the cache, so a response whose request they invalidated still
-     * arrives, and this is where it dies. It is consumed (see `consume`
-     * above) and dropped — no DRIS write, no shelf entry, no fetch_ptr
-     * advance, and ct_redirect inherits the gate for free, so a squashed
-     * group cannot redirect anything either.
-     *
-     * The mispredict/trap terms stay: f2.good is registered and cannot see
-     * a redirect raised this cycle, and entries written this cycle would be
-     * younger than the flush point but invisible to the (registered) flush
-     * mask. The combinational gate covers this cycle, the valid bit covers
-     * every cycle after. */
-    assign issue_fire = core_rsp_data_valid && f2.good && !intake_stall &&
-                        !mispredict_valid && !trap_valid;
-
-    /* =================================================================
-     * Redirect at issue
-     *
-     * Fetch runs sequentially, so a redirect fires whenever the group
-     * was cut before its natural end and execution resumes off the
-     * sequential path (JAL target, predicted-taken BTB target, or a
-     * younger JALR's own PC). ct_resume_pc comes from group formation.
-     * ================================================================= */
-    assign ct_redirect = issue_fire && ct_redirect_pend;
-    assign redirect    = trap_valid | mispredict_valid | ct_redirect;
-
-    always_comb begin : redirect_pc_mux
-        if (trap_valid)            redirect_pc = trap_pc;
-        else if (mispredict_valid) redirect_pc = mispredict_pc;
-        else                       redirect_pc = ct_resume_pc;
-    end : redirect_pc_mux
+    assign issue_fire = (|slot_valid) & ~stall_D & ~flush;
 
     /* =================================================================
      * DRIS intake
@@ -589,14 +421,17 @@ module InstructionIssueUnit #(
         for (int w = 0; w < FETCH_WORDS; w++) begin
             dris_intake_pkts[w]                = '0;
             dris_intake_pkts[w].valid_R        = issue_fire && slot_valid[w];
-            dris_intake_pkts[w].pc_R           = slot_pc[w];
-            dris_intake_pkts[w].rd_R           = slot_ctrl[w].rfWrite ? slot_rd[w]  : '0;
-            dris_intake_pkts[w].rs1_R          = slot_ctrl[w].uses_rs1 ? slot_rs1[w] : '0;
-            dris_intake_pkts[w].rs2_R          = slot_ctrl[w].uses_rs2 ? slot_rs2[w] : '0;
-            dris_intake_pkts[w].ctrl_signals_R = slot_ctrl[w];
-            dris_intake_pkts[w].imm_R          = slot_imm[w];
+            dris_intake_pkts[w].pc_R           = {block_pc_D[w], 2'b00};
+            dris_intake_pkts[w].rd_R           = decoded_instrs_D[w].ctrl_signals.rfWrite
+                                               ? decoded_instrs_D[w].rd  : '0;
+            dris_intake_pkts[w].rs1_R          = decoded_instrs_D[w].ctrl_signals.uses_rs1
+                                               ? decoded_instrs_D[w].rs1 : '0;
+            dris_intake_pkts[w].rs2_R          = decoded_instrs_D[w].ctrl_signals.uses_rs2
+                                               ? decoded_instrs_D[w].rs2 : '0;
+            dris_intake_pkts[w].ctrl_signals_R = decoded_instrs_D[w].ctrl_signals;
+            dris_intake_pkts[w].imm_R          = decoded_instrs_D[w].imm;
             `ifdef DEBUG
-                dris_intake_pkts[w].debug_instr_R = core_rsp_data[w];
+                dris_intake_pkts[w].debug_instr_R = fetched_instructions_D[w];
             `endif
         end
     end : dris_intake
@@ -621,52 +456,24 @@ module InstructionIssueUnit #(
     end : fetch_ptr_reg
 
     /* =================================================================
-     * BTB: single read port (the group's oldest branch/JALR, keyed on
-     * the slot's own PC) and single write port (the shelf's one resolve
-     * per cycle). JALs are neither looked up nor written — their
-     * targets come straight from decode. CTRL_SIGNALS_NOOP's PC_plus4
-     * holds the internal write-enable off between training packets.
-     * ================================================================= */
-    ctrl_signals_t btb_write_ctrl;
-    assign btb_write_ctrl = btb_train.valid ? btb_train.ctrl_signals
-                                            : CTRL_SIGNALS_NOOP;
-
-    BTBPredictor btb (
-        .clk                       (clock),
-        .rst_l                     (reset_n),
-        .pc_F1                     (slot_pc[primary_ct_slot]),
-        .npc_plus4_F1              (slot_pc[primary_ct_slot] + XLEN'(4)),
-        .predicted_next_pc         (btb_predicted_pc),
-        .read_btb_hist             (btb_read_hist),
-        .taken_branch              (),
-        .btb_hit                   (),
-        .bcond_write               (btb_train.taken),
-        .ctrl_signals_write        (btb_write_ctrl),
-        .correct_branch_prediction (btb_train.correct),
-        .pc_write                  (btb_train.pc),
-        .npc_offset_write          (btb_train.next_pc),
-        .write_btb_hist            (btb_train.hist)
-    );
-
-    /* =================================================================
-     * Branch shelf intake: one packet per valid CT slot. intake_stall
+     * Branch shelf intake: one packet per valid CT slot. The intake stall
      * guarantees enough free shelf entries for all of them.
+     *
+     * Unlike the single-ported predictor this replaced, every slot carries
+     * real counter bits — BTBPredictor4 looked all four up — so there is no
+     * "primary CT owns the read port" slot to special-case and no cold
+     * counter for the younger ones to train from.
      * ================================================================= */
     always_comb begin : shelf_intake
         shelf_in_pkt = '0;
         for (int w = 0; w < FETCH_WORDS; w++) begin
             if (issue_fire && slot_valid[w] && slot_is_ct[w]) begin
                 shelf_in_pkt[w].valid        = 1'b1;
-                shelf_in_pkt[w].pc           = slot_pc[w];
-                shelf_in_pkt[w].predicted_pc = slot_pred_pc[w];
+                shelf_in_pkt[w].pc           = {block_pc_D[w], 2'b00};
+                shelf_in_pkt[w].predicted_pc = {btb_pred_pc_block_D[w], 2'b00};
                 shelf_in_pkt[w].id           = slot_id(fetch_ptr, w);
-                shelf_in_pkt[w].ctrl_signals = slot_ctrl[w];
-                // Only the BTB-read slot has meaningful counter bits;
-                // everything else trains from a cold counter.
-                shelf_in_pkt[w].btb_hist =
-                    (primary_ct_found && w == primary_ct_slot &&
-                     slot_ctrl[w].pc_source != PC_uncond) ? btb_read_hist
-                                                          : 2'b00;
+                shelf_in_pkt[w].ctrl_signals = decoded_instrs_D[w].ctrl_signals;
+                shelf_in_pkt[w].btb_hist     = btb_read_hist_D[w];
             end
         end
     end : shelf_intake
@@ -696,6 +503,72 @@ module InstructionIssueUnit #(
         .perf_resolve_wrong_squashed (perf_branch_mispredict_squashed)
     );
 
+    assign flush = trap_valid || mispredict_valid;
+
+    /* =================================================================
+     * Intake room.
+     *
+     * Both reserve a whole group rather than the exact count, because the PC
+     * stage decides three cycles before D knows how many slots the group
+     * actually has. Reserving FETCH_WORDS shelf entries is also what makes a
+     * per-group control-transfer cap unnecessary — a group cannot present
+     * more CTs than it has slots.
+     * ================================================================= */
+    logic [DRIS_ID_WIDTH:0] occupancy;
+    assign occupancy  = fetch_ptr - retire_ptr;  // color-bit MSB makes this mod-2N
+    assign dris_full  = (DRIS_NUM_ENTRIES - int'(occupancy)) < FETCH_WORDS;
+    assign shelf_full = int'(shelf_free_count) < FETCH_WORDS;
+
+    always_comb begin : stall_logic
+        {instr_stall, stall_pc, stall_F1, stall_F2, stall_D} = '0;
+        if (dris_full | shelf_full) begin
+            //if out of space, stall everything
+            {instr_stall, stall_pc, stall_F1, stall_F2, stall_D} = 5'b11111;
+        end else if (~core_rsp_data_valid & ~core_rsp_ready) begin
+            //if the cache pipeline is full and the data isnt back yet
+            //stall everything
+            {instr_stall, stall_pc, stall_F1, stall_F2, stall_D} = 5'b11111;
+        end else if (core_rsp_data_valid & ~core_rsp_ready) begin
+            //data is back but the cache cant take a new request: drain F2/D
+            //and freeze the front. F1_to_F2 inserts a bubble for this case.
+            {instr_stall, stall_pc, stall_F1, stall_F2, stall_D} = 5'b11100;
+        end
+
+        //this still doesnt make sense to me but it works in the inorder core
+        // Remaining cases (~core_rsp_data_valid &  core_rsp_ready) and
+        //                  (core_rsp_data_valid &  core_rsp_ready) need no stall.
+    end : stall_logic
+
+    // peek_only: hold the controller's response head. Paired with the F2
+    // bubble above, this keeps FIFO pops equal to real groups latched at D.
+    assign core_req_stall_mem = instr_stall;
+
+    /* =================================================================
+     * Positional-tracking check.
+     *
+     * F2 is the response stage: a request accepted at cycle N reaches
+     * block_pc_F2 at N+2, which is the cycle its response reaches the FIFO
+     * head. Nothing counts outstanding requests, so if the stall table ever
+     * lets those two drift apart, instructions are silently paired with the
+     * wrong PCs. Fatal, not $error — a desync must crash the run, not turn up
+     * as a register mismatch dozens of instructions later.
+     *
+     * The `$time > 0` guard is not decoration: the testbench's clk starts at
+     * 1, so its initialization counts as a posedge at time 0 in a 4-state
+     * simulator, and reset_n is still high there. Everything below is X on
+     * that edge, and $fatal would not survive it.
+     * ================================================================= */
+    // synopsys translate_off
+    always_ff @(posedge clock) begin : fetch_position_assertion
+        if ((reset_n === 1'b1) && ($time > 0) &&
+            core_rsp_data_valid && !tagged(block_pc_F2[0])) begin
+            assert (core_rsp_addr == block_pc_F2[0])
+            else $fatal(1, "%0t %m: fetch position desync - rsp=%h F2=%h",
+                        $time, {core_rsp_addr, 2'b00}, {block_pc_F2[0], 2'b00});
+        end
+    end : fetch_position_assertion
+    // synopsys translate_on
+
     /* =================================================================
      * Perf observation drive. shelf_free_count is the shelf's own
      * output, so occupancy is just its complement; the stall reasons
@@ -706,9 +579,9 @@ module InstructionIssueUnit #(
                                       DRIS_defs::BRANCH_SHELF_ENTRIES) -
                                   shelf_free_count;
     assign perf_mispredict_valid = mispredict_valid;
-    assign perf_intake_stall     = intake_stall;
-    assign perf_stall_dris_full  = core_rsp_data_valid && f2.good && !dris_room;
-    assign perf_stall_shelf_full = core_rsp_data_valid && f2.good && !shelf_room;
+    assign perf_stall_pc         = stall_pc;
+    assign perf_stall_dris_full  = dris_full;
+    assign perf_stall_shelf_full = shelf_full;
     assign perf_issue_fire       = issue_fire;
 
     // TODO: core_rsp_excpt -> instruction-fetch fault (trap plumbing).

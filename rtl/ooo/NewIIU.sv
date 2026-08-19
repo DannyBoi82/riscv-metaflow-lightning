@@ -275,21 +275,6 @@ module InstructionIssueUnit #(
         end : slot_decode
     endgenerate
 
-    //this might be backwards
-    logic [3:0] slot_valid;
-    always_comb begin : slot_valid_logic
-        case (block_pc_D[0][3:2])
-            2'b00: slot_valid = 4'b1111;
-            2'b01: slot_valid = 4'b1110;
-            2'b10: slot_valid = 4'b1100;
-            2'b11: slot_valid = 4'b1000;
-        endcase
-        slot_valid = slot_valid & {4{~flush}} & {4{core_rsp_data_valid}};
-    end : slot_valid_logic
-
-    // block_pc_D
-    // btb_read_hist_D
-    // fetched_instructions_D 
 
 
     /* =================================================================

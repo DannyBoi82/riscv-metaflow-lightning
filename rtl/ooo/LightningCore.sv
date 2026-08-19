@@ -203,7 +203,7 @@ module LightningCore #(
     logic [$clog2(DRIS_defs::BRANCH_SHELF_ENTRIES+1)-1:0] perf_shelf_occupancy;
     logic perf_branch_resolved, perf_branch_mispredicted, perf_mispredict_valid;
     logic perf_branch_mispredict_squashed;
-    logic perf_intake_stall, perf_stall_dris_full, perf_stall_shelf_full;
+    logic perf_stall_pc, perf_stall_dris_full, perf_stall_shelf_full;
     logic perf_issue_fire;
 
     // Scheduler <-> register file read ports
@@ -270,7 +270,7 @@ module LightningCore #(
         .perf_branch_mispredicted (perf_branch_mispredicted),
         .perf_branch_mispredict_squashed (perf_branch_mispredict_squashed),
         .perf_mispredict_valid    (perf_mispredict_valid),
-        .perf_intake_stall        (perf_intake_stall),
+        .perf_stall_pc        (perf_stall_pc),
         .perf_stall_dris_full     (perf_stall_dris_full),
         .perf_stall_shelf_full    (perf_stall_shelf_full),
         .perf_issue_fire          (perf_issue_fire)
@@ -1033,7 +1033,7 @@ module LightningCore #(
             CT_inst_num  <= CT_inst_num  + perf_ret_ct;
 
             // ----- Part 1: front-end blocking / recovery -----
-            if (perf_intake_stall)     intake_stall_cycles <= intake_stall_cycles + 1;
+            if (perf_stall_pc)     intake_stall_cycles <= intake_stall_cycles + 1;
             if (perf_stall_dris_full)  stall_dris_full     <= stall_dris_full     + 1;
             if (perf_stall_shelf_full) stall_shelf_full    <= stall_shelf_full    + 1;
             if (perf_retired_now == 0) retire_drought_cycles <= retire_drought_cycles + 1;
