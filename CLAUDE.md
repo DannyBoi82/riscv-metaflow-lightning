@@ -60,13 +60,25 @@ structure changes.
   VCS, byte-identical binaries to the pre-OoO reference build. On
   `CORE=lightning` three of the four verify clean; **kosarajus hits the
   watchdog** (a Lightning-side fetch-path livelock — the baseline runs the
-  same binary to a `Correct` result in 15.3M cycles).
-- **The in-order core is also the performance baseline.** Lightning
-  currently beats it on dhrystone (1.24×) and `tests/c/fibi.c` (1.13×),
-  ties on fft, and is 20% slower on spmv. `docs/perf-counters.md` has the
-  standing, the counter inventory with per-counter trust status (several
-  counters on both cores are known-bad), the knob sweeps already tried,
-  and the hypotheses ruled out.
+  same binary to a `Correct` result in 15.3M cycles). **[2026-08-24] That
+  livelock is capacity-dependent**: at an 8-entry DRIS / 4-entry shelf
+  kosarajus completes correctly in 19.3M cycles, while at the 32/32/8
+  default it hangs at the same 112,300 retired it did before the IIU swap.
+- **The in-order core is also the performance baseline.** With the new IIU
+  (`fcadc38`, measured 2026-08-24) Lightning beats it on `tests/c/fibi.c`
+  (1.39×), dhrystone (1.21×) and fft (1.08×), and is 12% slower on spmv.
+  `docs/perf-counters.md` §1.0 has the standing, and §1.x down the counter
+  inventory with per-counter trust status (several counters on both cores
+  are known-bad), the knob sweeps already tried, and the hypotheses ruled
+  out. **Numbers are only meaningful with the `config.vh` knobs stated:**
+  `400a564` shipped a debug-shrunk 8-entry DRIS / 4-entry shelf, at which
+  Lightning loses to the baseline on every benchmark (the 4-entry shelf is
+  the binding constraint). Restored to 32/32/8 on 2026-08-24.
+- **[2026-08-24] The I$ miss bug below is fixed** — the cancel fix plus the
+  new IIU take fibi from 858 misses to **23** (13-block floor, baseline 21),
+  spmv to 142 and fft to 357,203. Only dhrystone got worse (498,092, against
+  448,076 for the cancel fix alone). Keep the diagnosis for the instruments
+  it names; do not quote its numbers.
 - **Lightning's I$ miss bug is diagnosed: `core_req_cancel` throws away a
   miss before any refill is requested.** fibi's 196-byte program fits in 13
   of the I$'s 64 blocks, yet Lightning misses 858 times (baseline: 21) while

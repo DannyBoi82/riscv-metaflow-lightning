@@ -1,15 +1,16 @@
 # Performance counters — what exists, what to trust, where we stand
 
-Status as of 2026-08-15. Companion to `docs/perf-counters-plan.md` (the plan,
-now executed) and the `2026-08-11` entries in `docs/porting-log.md` (the
+Standing as of 2026-08-24 (§1.0, the new IIU); counter inventory and analysis
+as of 2026-08-15. Companion to `docs/perf-counters-plan.md` (the plan, now
+executed) and the `2026-08-11` entries in `docs/porting-log.md` (the
 narrative). This file is the living reference: the counter inventory, their
 trust status, and the current standing against the baseline.
 
 **The in-order core is the baseline.** `CORE=inorder` (`rtl/core/riscv_core.sv`,
 the 8-stage in-order pipeline that passes the class autograder suite) is the
 number Lightning has to beat. Every Lightning result below is quoted as a ratio
-against it. At default configuration Lightning currently beats it on **one of
-four** perf benchmarks, plus `tests/c/fibi.c` (§1.1).
+against it. At default configuration Lightning beats it on **three of four**
+perf benchmarks, plus `tests/c/fibi.c` (§1.0).
 
 ---
 
@@ -17,6 +18,116 @@ four** perf benchmarks, plus `tests/c/fibi.c` (§1.1).
 
 `tests/perf`, VCS, defaults (32-entry DRIS, 4 fetch / 4 exec ways, 8-entry
 branch shelf, 1 KB I$ and 1 KB D$ both 2-way × 32 sets × 4-word blocks).
+
+### 1.0 New IIU (2026-08-24, `fcadc38`) — current standing
+
+The numbers in §1.1 and below are the **old** IIU. This section is the first
+perf measurement after the `InstructionIssueUnit` swap (four BTB predictions
+per group, positional `pc → F1 → F2 → D` tracking; `docs/new-iiu-status.md`).
+Flow: `make verify TEST=... SIM=vcs CORE=lightning PARAMS='+define+LTG_PERF'`.
+
+The baseline column is unchanged — the IIU is Lightning-only — and re-running
+`fibi` on `CORE=inorder` reproduced 25,321 cycles exactly, which is the
+cross-check that the old baseline numbers still hold.
+
+| benchmark | in-order | Lightning old IIU | Lightning **new IIU** | vs baseline (was) |
+|---|---:|---:|---:|---|
+| dhrystone | 12,184,845 | 9,828,242 | 10,074,367 | **1.21×** (was 1.24×) |
+| fft | 7,527,873 | 7,566,159 | 6,989,414 | **1.08×** (was 0.995×) |
+| spmv | 12,847,326 | 15,452,918 | 14,583,805 | **0.88×** (was 0.83×) |
+| kosarajus | 15,291,881, `Correct` | watchdog | watchdog | still fails (but see below) |
+| fibi | 25,321 | 22,438 | 18,215 | **1.39×** (was 1.13×) |
+
+Three of four moved the right way. **dhrystone is the one regression**
+(+2.5% cycles) and it is also the one benchmark whose I$ misses went up —
+those two facts probably belong to each other. fibi is the largest win,
+−18.8% cycles.
+
+IPC (same retired counts as below — fixed binaries, §3):
+
+| benchmark | in-order | old IIU | new IIU |
+|---|---:|---:|---:|
+| dhrystone | 0.401 | 0.497 | 0.485 |
+| fft | 0.516 | 0.514 | 0.556 |
+| spmv | 0.549 | 0.457 | 0.484 |
+| fibi | 0.889 | 1.003 | **1.236** |
+
+**The I$ miss pathology is substantially gone.** §4.1's 40.9×-on-fibi finding
+does not survive the swap:
+
+| benchmark | in-order | old IIU | new IIU |
+|---|---:|---:|---:|
+| fibi | 21 | 858 | **23** |
+| fft | 306,182 | 926,409 | **357,203** |
+| spmv | 112 | 244,900 | **142** |
+| dhrystone | 466,100 | 548,085 | 498,092 |
+
+fibi now sits at 23 against a 13-block cold-miss floor, and fft's 3.0× miss
+ratio is down to 1.17×. dhrystone is worse than the **448,076** the §4.1b
+cancel fix alone achieved on the old IIU — the only benchmark where the new
+front end costs cache behaviour rather than buying it.
+
+**Correctness recovered.** All four `tests/perf` benchmarks now verify
+`Correct`. `docs/new-iiu-status.md` recorded fft and spmv as regressed as of
+2026-08-19; they pass as of `fcadc38`.
+
+fibi front end, against the same fields §1.1 reports for the old IIU:
+
+| metric | old IIU | new IIU |
+|---|---:|---:|
+| total cycles | 22,438 | 18,215 |
+| instructions fetched | 28,331 | 29,766 |
+| speculation tax | 1.259 | 1.323 |
+| branches resolved | 5,965 | 5,992 |
+| mispredicted / redirects | 821 / 793 | 821 / 794 |
+| mispredict rate | 0.138 | 0.137 |
+| cycles with no retire | 9,736 (43%) | 9,348 (51%) |
+| intake stall cycles | 0 | 3,881 (DRIS 950 / shelf 3,033) |
+| DRIS occupancy avg | 5.6 of 32 | **13.99 of 32** (max 30) |
+| integer slots used/cycle | 29.9% of 4 | 35.7% of 4 |
+
+The win is occupancy, and it is exactly the mechanism the swap was for: four
+real predictions per group instead of one keeps 14 entries in flight where the
+old front end managed 5.6, and the machine drains them faster than it can now
+refill — which is why intake stall cycles appear (3,881, mostly shelf) where
+the old IIU had literally zero. The mispredict *rate* barely moved (0.138 →
+0.137), so none of this came from better prediction accuracy; it came from
+fetch bandwidth. Absolute no-retire cycles fell (9,736 → 9,348) even as their
+share of a shorter run rose to 51% — the front end is still the limiter, just
+a faster one.
+
+#### The knob config matters more than the IIU did
+
+`400a564` committed `config.vh` with debug-shrunk knobs — `LTG_DRIS_ENTRIES`
+and `LTG_SCHED_ENTRIES_CHECKED` at 8, `LTG_BRANCH_SHELF_ENTRIES` at 4. At
+those values Lightning loses to the baseline on **everything**:
+
+| benchmark | Lightning @ 8/8/4 | vs baseline |
+|---|---:|---|
+| dhrystone | 14,157,471 | 0.86× |
+| fft | 10,854,141 | 0.69× |
+| spmv | 18,767,890 | 0.68× |
+| kosarajus | 19,338,112, `Correct` | 0.79× |
+
+The stall breakdown names the culprit: "branch shelf full" is 5.9–7.2M cycles
+at shelf=4 against 80K–1.9M at shelf=8. **The 4-entry shelf is the binding
+constraint, not the DRIS.** `config.vh` was restored to 32/32/8 on 2026-08-24;
+quote no Lightning number without checking which knobs it was taken at.
+
+#### kosarajus: the livelock is capacity-dependent
+
+The most useful thing to fall out of the sweep. kosarajus **completes**
+correctly at 8/8/4 in 19,338,112 cycles, but at 32/32/8 it still watchdogs
+with 112,300 retired and IPC 0.006 — the *identical* retire count §1 records
+for the old IIU. So the hang survived the IIU swap unchanged and is a function
+of DRIS/shelf capacity, which is a much sharper lead than "fetch-path
+livelock" was. Whatever it is, a smaller window steps around it.
+
+### 1.x Old IIU (2026-08-15) — history
+
+Everything from here to the end of §1 predates the IIU swap. Kept because the
+analysis (the two regimes in §1.2, the occupancy-definition gap in §1.3, the
+§4 hypotheses) is still the reasoning that applies; only the numbers moved.
 
 | benchmark | in-order (baseline) | Lightning | Lightning vs baseline |
 |---|---:|---:|---|
