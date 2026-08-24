@@ -39,7 +39,7 @@ typedef struct packed {
  *
  * Wrong-path groups are killed with the in-order core's PC-tag trick: a flush
  * stamps WPC_FLUSH into every stage, a stall bubble stamps WPC_BUBBLE into F2,
- * and the D stage drops any group whose PC is tagged before it reaches the
+ * and the D stage drops any group whose PC is is_invalid_pc before it reaches the
  * DRIS. Reset stamps a bubble too, which is what covers startup.
  *
  * Prediction: BTBPredictor4 gives every slot of the group its own lookup, so
@@ -175,7 +175,7 @@ module InstructionIssueUnit #(
     localparam logic [XLEN-1:2] WPC_FLUSH  = (XLEN-2)'(pc_mispredict_flush);
     localparam logic [XLEN-1:2] WPC_BUBBLE = (XLEN-2)'(pc_stall_bubble);
 
-    function automatic logic tagged(input logic [XLEN-1:2] wpc);
+    function automatic logic is_invalid_pc(input logic [XLEN-1:2] wpc);
         return (wpc == WPC_FLUSH) || (wpc == WPC_BUBBLE);
     endfunction
 
@@ -187,7 +187,7 @@ module InstructionIssueUnit #(
     end
 
     assign core_req_addr = pc[ADDRESS_SIZE+1:2];
-    assign core_req_re   = ~dris_full & ~shelf_full;
+    assign core_req_re   = ~dris_full & ~shelf_full & core_rsp_ready & ~flush;
 
     /* Cancel on a mispredict only.
      *
@@ -391,11 +391,11 @@ module InstructionIssueUnit #(
      * covers the group.
      * ================================================================= */
     logic [FETCH_WORDS-1:0] slot_valid, slot_is_ct;
-    logic                   group_tagged;
+    logic                   group_is_invalid_pc;
 
-    assign group_tagged = tagged(block_pc_D[0]);
+    assign group_is_invalid_pc = is_invalid_pc(block_pc_D[0]);
     assign slot_valid   = fetched_instructions_valid_D &
-                          {FETCH_WORDS{~group_tagged}};
+                          {FETCH_WORDS{~group_is_invalid_pc}};
 
     always_comb begin : slot_ct_logic
         for (int w = 0; w < FETCH_WORDS; w++)
@@ -561,7 +561,7 @@ module InstructionIssueUnit #(
     // synopsys translate_off
     always_ff @(posedge clock) begin : fetch_position_assertion
         if ((reset_n === 1'b1) && ($time > 0) &&
-            core_rsp_data_valid && !tagged(block_pc_F2[0])) begin
+            core_rsp_data_valid && !is_invalid_pc(block_pc_F2[0])) begin
             assert (core_rsp_addr == block_pc_F2[0])
             else $fatal(1, "%0t %m: fetch position desync - rsp=%h F2=%h",
                         $time, {core_rsp_addr, 2'b00}, {block_pc_F2[0], 2'b00});

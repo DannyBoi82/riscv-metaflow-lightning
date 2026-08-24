@@ -5,6 +5,10 @@
 
 `define DEBUG
 
+// `ifndef LTG_PERF
+// `define LTG_PERF
+// `endif
+
 //stages:
 // fetch = F
 // rename = R

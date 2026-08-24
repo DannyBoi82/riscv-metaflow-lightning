@@ -60,12 +60,12 @@
 
 // DRIS (Deferred-scheduling Register Instruction Shelf) entries
 `ifndef LTG_DRIS_ENTRIES
-`define LTG_DRIS_ENTRIES 32
+`define LTG_DRIS_ENTRIES 8
 `endif
 
 // DRIS entries the scheduler checks for readiness each cycle
 `ifndef LTG_SCHED_ENTRIES_CHECKED
-`define LTG_SCHED_ENTRIES_CHECKED 32
+`define LTG_SCHED_ENTRIES_CHECKED 8
 `endif
 
 
@@ -101,7 +101,7 @@
 
 // Unresolved speculative branches the branch shelf can hold
 `ifndef LTG_BRANCH_SHELF_ENTRIES
-`define LTG_BRANCH_SHELF_ENTRIES 8
+`define LTG_BRANCH_SHELF_ENTRIES 4
 `endif
 
 

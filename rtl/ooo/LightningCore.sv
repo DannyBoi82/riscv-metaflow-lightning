@@ -2,27 +2,6 @@
 
 `include "riscv_commit.vh"
 
-/* Performance counters are simulation-only: comment this out before
- * synthesis, same as the in-order core's `PERF (rtl/core/riscv_core.sv
- * line 36). Only the counter block at the bottom of this file is gated by
- * it — the cache-event input ports and the IIU's perf outputs are always
- * present, so the port list has the same shape in every build.
- *
- * Deliberately NOT named `PERF. Macros carry across files on the compiler
- * command line, rtl/core is compiled before rtl/ooo (Makefile
- * RTL_DIR_ORDER), and riscv_core.sv is in every build regardless of CORE —
- * so riscv_core.sv's `define PERF is already in scope here. Sharing the
- * name means commenting this line out does nothing until you also comment
- * out the in-order core's, which is exactly the trap `1DRIS_defs.sv warns
- * about for DEBUG. LTG_PERF is Lightning's own switch, per the LTG_*
- * convention in rtl/include/config.vh.
- *
- * `ifndef-guarded so a `PARAMS='+define+LTG_PERF'` on the command line
- * (scripts/cache_sweep.py does this) isn't a redefinition. */
-`ifndef LTG_PERF
-`define LTG_PERF
-`endif
-
 import DRIS_defs::*;
 import RISCV_ISA::*;
 import RISCV_UArch::*;  // Import microarchitecture parameters and definitions
