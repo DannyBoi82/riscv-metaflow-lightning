@@ -11,3 +11,4 @@ in order of discovery
 8. you actually need to clear locker_valid if the dependency retires
 9. you need to not clear locker valid on lockers that are currently being written to. raceish condition where the clear valid check happens after the new writes, so a new locker computed correctly could be eaten by a clear valid from something that retired this cycle.
 10. dris writeback needs many more guards than just "does the id match"
+11. the new fetch unit needs still needs to be able to cut a fetch group early to not intake pcs that were fetched twice accid

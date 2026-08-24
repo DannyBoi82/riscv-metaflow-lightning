@@ -43,8 +43,10 @@ typedef struct packed {
  * DRIS. Reset stamps a bubble too, which is what covers startup.
  *
  * Prediction: BTBPredictor4 gives every slot of the group its own lookup, so
- * group shape falls out of the predictions alone — slot w is valid iff its PC
- * is what slot w-1 predicted. There are no decode-stage cuts. A JAL or JALR
+ * group shape falls out of the predictions alone — slot w is valid iff slot
+ * w-1 predicted not-taken and predicted slot w's PC. A predicted-taken slot
+ * always ends the group, mirroring best_pick's cut, even when its target is
+ * its own pc+4 (see valid_instrs_logic). There are no decode-stage cuts. A JAL or JALR
  * whose BTB entry is cold mispredicts once, the shelf resolves it and trains
  * the exact target, and it predicts correctly from then on. The only redirect
  * sources are trap_valid and the shelf's mispredict_valid.
@@ -226,6 +228,13 @@ module InstructionIssueUnit #(
     logic [1:0]      btb_read_hist_F1 [FETCH_WORDS-1:0],
                      btb_read_hist_F2 [FETCH_WORDS-1:0],
                      btb_read_hist_D  [FETCH_WORDS-1:0];
+    // Per-slot predicted-taken, piped with the prediction it belongs to. The
+    // validity chain needs it because "pred == pc+4" alone cannot tell a
+    // fall-through prediction from a taken prediction whose target happens to
+    // be pc+4 (a strongly-taken branch that resolved not-taken once trains
+    // exactly that entry), while best_pick keys on taken_branch and redirects
+    // the next fetch there — the group tail would issue twice.
+    logic [FETCH_WORDS-1:0] btb_taken, btb_taken_F1, btb_taken_F2;
 
     always_comb begin : block_pc_gen
         for (int w = 0; w < FETCH_WORDS; w++)
@@ -239,10 +248,12 @@ module InstructionIssueUnit #(
                 btb_pred_pc_block_F1[w] <= '0;
                 btb_read_hist_F1[w]     <= '0;
             end
+            btb_taken_F1 <= '0;
         end else if (~stall_F1) begin
             block_pc_F1          <= block_pc;
             btb_pred_pc_block_F1 <= btb_pred_pc_block;
             btb_read_hist_F1     <= btb_read_hist;
+            btb_taken_F1         <= btb_taken;
         end
     end
 
@@ -256,7 +267,7 @@ module InstructionIssueUnit #(
         .best_prediction           (btb_best_prediction), //the pc most likely to
         //be fetched next, straight to the pc (the i cache)
         .read_btb_hist             (btb_read_hist), //this is also a vector now
-        .taken_branch              (),
+        .taken_branch              (btb_taken),
         .btb_hit                   (),
 
         // only one write port because the branch shelf
@@ -285,6 +296,7 @@ module InstructionIssueUnit #(
                 btb_pred_pc_block_F2[w] <= '0;
                 btb_read_hist_F2[w]     <= '0;
             end
+            btb_taken_F2 <= '0;
         end else if (~stall_F2 & stall_F1) begin
             // F2 is draining but F1 is frozen. Insert a bubble so the same
             // fetch group is not re-latched out of the held F1 register — it
@@ -297,10 +309,12 @@ module InstructionIssueUnit #(
                 btb_pred_pc_block_F2[w] <= '0;
                 btb_read_hist_F2[w]     <= '0;
             end
+            btb_taken_F2 <= '0;
         end else if (~stall_F2) begin
             block_pc_F2          <= block_pc_F1;
             btb_pred_pc_block_F2 <= btb_pred_pc_block_F1;
             btb_read_hist_F2     <= btb_read_hist_F1;
+            btb_taken_F2         <= btb_taken_F1;
         end
     end
 
@@ -324,6 +338,14 @@ module InstructionIssueUnit #(
                     // fetch_ptr + w, so a hole would shift every younger
                     // slot's ID off its own instruction.
                     fetched_instructions_valid_F2[w-1] &&
+                    // A predicted-taken slot ends the group even when its
+                    // target is its own pc+4 — best_pick redirects the next
+                    // fetch to that target, so keeping the tail here would
+                    // issue it twice. (Target == pc+4 is a real BTB state: a
+                    // strongly-taken branch resolving not-taken once trains
+                    // it.) This is the cut that keeps the group shape and
+                    // best_prediction agreeing on where the next group starts.
+                    ~btb_taken_F2[w-1] &&
                     (block_pc_F2[w] == btb_pred_pc_block_F2[w-1]) &&
                     // ...and slot w has to still be inside slot 0's cache
                     // block. The chain cannot see the block boundary by
