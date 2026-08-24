@@ -242,9 +242,16 @@ module InstructionIssueUnit #(
     end : block_pc_gen
 
     always_ff @(posedge clock, negedge reset_n) begin: PCtoF1
-        if (~reset_n | flush) begin
+        if (~reset_n) begin
             for (int w = 0; w < FETCH_WORDS; w++) begin
-                block_pc_F1[w]          <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                block_pc_F1[w]          <= WPC_BUBBLE;
+                btb_pred_pc_block_F1[w] <= '0;
+                btb_read_hist_F1[w]     <= '0;
+            end
+            btb_taken_F1 <= '0;
+        end else if (flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_F1[w]          <= WPC_FLUSH;
                 btb_pred_pc_block_F1[w] <= '0;
                 btb_read_hist_F1[w]     <= '0;
             end
@@ -290,9 +297,16 @@ module InstructionIssueUnit #(
                                       : btb_best_prediction;
 
     always_ff @(posedge clock, negedge reset_n) begin: F1_to_F2
-        if (~reset_n | flush) begin
+        if (~reset_n) begin
             for (int w = 0; w < FETCH_WORDS; w++) begin
-                block_pc_F2[w]          <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                block_pc_F2[w]          <= WPC_BUBBLE;
+                btb_pred_pc_block_F2[w] <= '0;
+                btb_read_hist_F2[w]     <= '0;
+            end
+            btb_taken_F2 <= '0;
+        end else if (flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_F2[w]          <= WPC_FLUSH;
                 btb_pred_pc_block_F2[w] <= '0;
                 btb_read_hist_F2[w]     <= '0;
             end
@@ -362,9 +376,17 @@ module InstructionIssueUnit #(
     end : valid_instrs_logic
 
     always_ff @(posedge clock, negedge reset_n) begin: F2_to_DS
-        if (~reset_n | flush) begin
+        if (~reset_n) begin
             for (int w = 0; w < FETCH_WORDS; w++) begin
-                block_pc_D[w]           <= ~reset_n ? WPC_BUBBLE : WPC_FLUSH;
+                block_pc_D[w]           <= WPC_BUBBLE;
+                btb_pred_pc_block_D[w]  <= '0;
+                btb_read_hist_D[w]      <= '0;
+                fetched_instructions_D[w] <= '0;
+            end
+            fetched_instructions_valid_D <= '0;
+        end else if (flush) begin
+            for (int w = 0; w < FETCH_WORDS; w++) begin
+                block_pc_D[w]           <= WPC_FLUSH;
                 btb_pred_pc_block_D[w]  <= '0;
                 btb_read_hist_D[w]      <= '0;
                 fetched_instructions_D[w] <= '0;
