@@ -1,0 +1,192 @@
+name: sweep
+
+# Parameter sweeps for Lightning. One matrix job per Verilator build; each job
+# runs every test in its list against that one build.
+#
+# Results land as CSV on the `ci-results` branch, which means they are readable
+# over plain raw.githubusercontent.com with no token — handy for pasting a URL
+# at a tool that can fetch but can't authenticate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Sweep mode"
+        type: choice
+        options: [bisect-dris, perf-ofat, perf-2d]
+        default: perf-ofat
+      tests:
+        description: "Space-separated test paths (blank = mode default)"
+        type: string
+        default: ""
+      core:
+        description: "Which core"
+        type: choice
+        options: [lightning, inorder]
+        default: lightning
+
+concurrency:
+  group: sweep-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/lightning-toolchain:latest
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build the toolchain image only if the Dockerfile changed. Otherwise the
+  # cached layers make this ~20s.
+  # --------------------------------------------------------------------------
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .github/docker
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --------------------------------------------------------------------------
+  # Turn the sweep mode into a JSON matrix.
+  # --------------------------------------------------------------------------
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      configs: ${{ steps.gen.outputs.configs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          CFG=$(python3 scripts/gen-sweep.py \
+                  --mode '${{ inputs.mode }}' \
+                  --tests '${{ inputs.tests }}')
+          echo "configs=$CFG" >> "$GITHUB_OUTPUT"
+          echo "$CFG" | python3 -m json.tool
+
+  # --------------------------------------------------------------------------
+  # The sweep itself.
+  # --------------------------------------------------------------------------
+  run:
+    needs: [image, plan]
+    runs-on: ubuntu-24.04
+    container: ghcr.io/${{ github.repository_owner }}/lightning-toolchain:latest
+    strategy:
+      fail-fast: false          # a failing config is data, not a reason to stop
+      max-parallel: 20          # free public repos get ~20 concurrent runners
+      matrix:
+        cfg: ${{ fromJSON(needs.plan.outputs.configs) }}
+    env:
+      # Exported once so EVERY make invocation in this job sees identical
+      # values. This matters: config.mk's BUILD_FLAGS_ID hashes PARAMS into
+      # .buildflags, so a PARAMS string that differs between `make build` and
+      # `make verify` would silently trigger a second, different build.
+      SIM: verilator
+      CORE: ${{ inputs.core }}
+      VERILATOR: verilator       # override config.mk's $(HOME)/.local default
+      RISCV_PREFIX: riscv32-unknown-elf-
+      PARAMS: ${{ matrix.cfg.params }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build refsim
+        run: make -C tools/refsim
+
+      - name: Build design
+        run: |
+          echo "PARAMS = $PARAMS"
+          make build
+
+      - name: Run tests
+        run: |
+          OUT=output/verilator
+          echo "config,test,status,cycles,mem_accesses" > result.csv
+          for t in ${{ matrix.cfg.tests }}; do
+            if make verify TEST="$t" > "verify.log" 2>&1; then
+              status=pass
+            elif grep -q '^TIMEOUT:' "$OUT/simulation.log" 2>/dev/null; then
+              status=timeout
+            else
+              status=fail
+            fi
+            cyc=$(grep -oP 'at Cycle \K[0-9]+' "$OUT/simulation.reg2" 2>/dev/null | tail -1)
+            mem=$(grep -oP 'Mem Accesses: \K[0-9]+' "$OUT/simulation.reg2" 2>/dev/null | tail -1)
+            echo "${{ matrix.cfg.name }},$t,$status,${cyc:-NA},${mem:-NA}" >> result.csv
+            # Keep the log for anything that did not pass cleanly.
+            if [ "$status" != pass ]; then
+              mkdir -p failed/"${{ matrix.cfg.name }}"
+              b=$(basename "$t")
+              cp verify.log "failed/${{ matrix.cfg.name }}/${b}.verify.log"
+              cp "$OUT/simulation.log" "failed/${{ matrix.cfg.name }}/${b}.sim.log" 2>/dev/null || true
+            fi
+          done
+          cat result.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.cfg.name }}
+          path: |
+            result.csv
+            failed/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # Merge every CSV and commit it to `ci-results` so it is fetchable without
+  # a token at:
+  #   raw.githubusercontent.com/<owner>/<repo>/ci-results/<run_id>/results.csv
+  # --------------------------------------------------------------------------
+  collect:
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci-results
+          fetch-depth: 1
+        continue-on-error: true   # first run: branch does not exist yet
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: result-*
+          merge-multiple: false
+
+      - name: Merge
+        run: |
+          DIR="${{ github.run_id }}"
+          mkdir -p "$DIR"
+          echo "config,test,status,cycles,mem_accesses" > "$DIR/results.csv"
+          find dl -name result.csv -exec tail -n +2 {} \; | sort >> "$DIR/results.csv"
+          find dl -path '*/failed/*' -type f -exec cp --parents {} "$DIR"/ \; 2>/dev/null || true
+          {
+            echo "mode: ${{ inputs.mode }}"
+            echo "core: ${{ inputs.core }}"
+            echo "commit: ${{ github.sha }}"
+          } > "$DIR/meta.txt"
+          rm -rf dl
+          cp "$DIR/results.csv" latest.csv
+          column -s, -t "$DIR/results.csv" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Push to ci-results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B ci-results
+          git add -A
+          git commit -m "sweep ${{ inputs.mode }} @ ${{ github.sha }} (run ${{ github.run_id }})" || exit 0
+          git push -f origin ci-results
