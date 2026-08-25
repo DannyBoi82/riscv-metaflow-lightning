@@ -300,17 +300,20 @@ resolves) is the first suspect. Unmeasured so far — see open question 1.
 
 ## 2. Counter inventory
 
-### Lightning — `rtl/ooo/LightningCore.sv`, `` `ifdef LTG_PERF `` (on by default in simulation)
+### Lightning — `rtl/ooo/LightningCore.sv`, `` `ifdef LTG_PERF `` (off by default)
 
 The switch is `` `LTG_PERF ``, **not** `` `PERF `` — `rtl/core` is compiled
 before `rtl/ooo` in every build regardless of `CORE`, so `riscv_core.sv`'s
 `` `define PERF `` is already in scope and sharing the name would silently make
 this file's switch a no-op. See `docs/architecture.md`.
 
-Auto-defined **only under `SIMULATION_18447`**, so `make synth` gets the
-counters off for free: `print_perf_metrics()` does `real` arithmetic, which DC
-rejects (ELAB-922). Pass `PARAMS='+define+LTG_PERF'` to force them on anyway
-(e.g. to measure what they cost in gates) — the explicit define still wins.
+The switch lives in `rtl/ooo/1DRIS_defs.sv` and is **commented out**, so it
+has to be asked for: `PARAMS='+define+LTG_PERF'` (or `PARAMS` in `config.mk`
+to make it stick); `scripts/cache_sweep.py` passes it. Leaving it off by
+default is also what keeps `make synth` working — `print_perf_metrics()` does
+`real` arithmetic, which DC rejects (ELAB-922). If it ever gets a default,
+guard it as `` `ifdef SIMULATION_18447 ``, the treatment `riscv_core.sv`'s
+`` `PERF `` gets.
 
 | counter | trust |
 |---|---|
@@ -333,7 +336,7 @@ rejects (ELAB-922). Pass `PARAMS='+define+LTG_PERF'` to force them on anyway
 | I$/D$ evictions | ❌ do not use (§3) |
 | I$/D$ accesses | ⚠️ main-memory port arbitration cycles, not cache probes |
 
-### In-order baseline — `rtl/core/riscv_core.sv`, `` `ifdef PERF `` (`define`d under `SIMULATION_18447`, same as `LTG_PERF` above)
+### In-order baseline — `rtl/core/riscv_core.sv`, `` `ifdef PERF `` (`define`d under `SIMULATION_18447`, so on in simulation and off for `make synth`)
 
 **Rewritten 2026-08-14 to match Lightning's block field for field** — same
 sections in the same order, the same `$display` strings, and the same
@@ -839,8 +842,8 @@ means something serial dominates spmv that none of these knobs touch.
 ```sh
 # baseline
 make sim TEST=tests/perf/spmv.c SIM=vcs CORE=inorder
-# lightning (LTG_PERF is on by default)
-make sim TEST=tests/perf/spmv.c SIM=vcs CORE=lightning
+# lightning (LTG_PERF must be asked for)
+make sim TEST=tests/perf/spmv.c SIM=vcs CORE=lightning PARAMS='+define+LTG_PERF'
 # a knob sweep, into its own build tree so the two cores don't clobber each other
 make sim TEST=tests/perf/spmv.c SIM=vcs CORE=lightning \
      OUTPUT_BASE_DIR=output-ltg-dris PARAMS="+define+LTG_DRIS_ENTRIES=64"

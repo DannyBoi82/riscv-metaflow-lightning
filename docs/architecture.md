@@ -251,7 +251,8 @@ only at retirement.
     (pc = `trap_pc`, no register write) to match the refsim, which does
     execute it.
   - **The performance counters** (very bottom of the file, `` `ifdef
-    LTG_PERF ``, on by default): cycles, retirements, fetches (DRIS
+    LTG_PERF ``, off by default — `PARAMS='+define+LTG_PERF'`):
+    cycles, retirements, fetches (DRIS
     intakes, so wrong-path included — the gap between the two is the
     speculation tax), instruction mix at retirement, front-end blocking
     (DRIS full / shelf full), flush and mispredict-redirect cycles,
