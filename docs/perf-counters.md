@@ -592,10 +592,13 @@ pessimistic count is non-zero as expected once the real and model LRU states
 diverge (§2). Even so, **29% of its I$ misses are avoidable**, and again
 almost all of them are misses killed by a cancel rather than lost refills.
 
-`e59a386` on `main` ("the fetch stage is a 2 stage pipeline like the in order
-core ... allows correctness without the use of the cancel signal, so now the
-same line isn't refetched when the pc redirects") is the fix for exactly this.
-Re-running the shadow across the two commits is the before/after measurement.
+`e59a386` ("the fetch stage is a 2 stage pipeline like the in order core ...
+allows correctness without the use of the cancel signal, so now the same line
+isn't refetched when the pc redirects") is *a* fix for exactly this. It is not
+on `main`: that line was parked on the `old-fetch-pipeline` branch when the
+new IIU landed, and the fix `main` carries is the new IIU's own F-queue —
+§4.1b. Re-running the shadow across the two commits is the before/after
+measurement, on whichever branch.
 
 ### 4.1b The fix works and costs cycles — measured (2026-08-15)
 

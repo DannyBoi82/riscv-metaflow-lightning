@@ -7,6 +7,21 @@ File/module map + how everything interacts: `docs/architecture.md` — read
 it first instead of re-exploring the tree; keep it updated when the
 structure changes.
 
+## Branches
+
+- **`main`** — the new IIU (`rtl/ooo/NewIIU.sv` + `BTBPredictor4`,
+  `BranchShelf`, `OldIIU` kept for reference), plus the synthesis flow
+  (`synth/dc_synth.tcl`, `rtl/mem/riscv_core_timing.sv`, the `make synth`
+  plumbing). This is the design.
+- **`old-fetch-pipeline`** — the earlier, separate answer to the I$-miss bug:
+  a two-stage fetch in the *old* IIU that tracks outstanding requests and
+  squashes wrong-path responses on arrival, with `core_req_cancel` tied low
+  and `perf_fill_cancel_*` counters in `cache_controller2`. Superseded by the
+  new IIU's F-queue and **not merged**; kept only to reference the approach
+  and its measurements (`docs/fetch-pipeline-plan.md` lives on that branch).
+- **`merged-pipelines`** — the short-lived merge that carried both front ends
+  at once. Dead end; delete once nothing is wanted from it.
+
 ## Commands
 
 - `make verify TEST=tests/asm/additest.S` — build, run, diff vs `.reg` oracle
@@ -91,7 +106,8 @@ structure changes.
   times and never installed. `tb/icache_shadow.sv`
   (`PARAMS='+define+ICACHE_SHADOW'`, `grep 'I$ SHADOW'`) is the instrument;
   `scripts/icache_shadow_report.py` names the offending blocks. See
-  `docs/perf-counters.md` §4.1a. `e59a386` on `main` claims the fix. Use fibi
+  `docs/perf-counters.md` §4.1a. `e59a386` claims the fix, but it lives on the
+  `old-fetch-pipeline` branch, not here — see the branch map below. Use fibi
   (22K cycles) to iterate, not the perf benchmarks (millions).
 - **C is compiled `-march=rv32i` (`RISCV_ARCH_C`), assembly `rv32im`
   (`RISCV_ARCH`).** Do not collapse these back into one knob. Nothing here
