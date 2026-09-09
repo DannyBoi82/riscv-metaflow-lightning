@@ -42,7 +42,25 @@ module MemoryScheduler #(
     output logic [REG_NUM_WIDTH-1:0] rs1_addr [TOTAL_PORTS-1:0],
     output logic [REG_NUM_WIDTH-1:0] rs2_addr [TOTAL_PORTS-1:0],
     input logic [XLEN-1:0] rs1_data [TOTAL_PORTS-1:0],
-    input logic [XLEN-1:0] rs2_data [TOTAL_PORTS-1:0]
+    input logic [XLEN-1:0] rs2_data [TOTAL_PORTS-1:0],
+
+    /* ============================================================
+     * Performance-counter observation. Always driven; only the
+     * counters in LightningCore consume them, and only under
+     * `LTG_PERF (same convention as the branch shelf's perf ports,
+     * so the port list has one shape in both builds).
+     *
+     * These separate the two reasons a load that is otherwise ready
+     * to go does not go this cycle:
+     *   - the D-cache is busy (a blocking cache with a miss in
+     *     flight), which is what a lockup-free cache would fix;
+     *   - memory ordering (MemoryScheduler.check_older_writes), which
+     *     is what store-to-load forwarding / disambiguation would fix.
+     * ============================================================ */
+    output logic perf_load_ready,        // >=1 load ready to issue this cycle
+    output logic perf_load_blk_dcache,   // ...but d_cache_ready is low
+    output logic perf_load_blk_unknown,  // ...but an older store's address is unknown
+    output logic perf_load_blk_alias     // ...but an older store aliases its address
 
 );
 
@@ -120,6 +138,44 @@ module MemoryScheduler #(
             end
         end
     end: selection_logic
+
+    /* Perf observation only: mirror selection_logic's admission test for
+     * loads without touching it, and attribute the block. A load counts as
+     * "ready" here on exactly the ready_vector condition selection_logic
+     * uses (valid, not dispatched, not executed, address computed); the
+     * store half of ready_vector is excluded because these counters are
+     * about the load path. Nothing here drives the design. */
+    always_comb begin: perf_load_block_obs
+        perf_load_ready       = 1'b0;
+        perf_load_blk_dcache  = 1'b0;
+        perf_load_blk_unknown = 1'b0;
+        perf_load_blk_alias   = 1'b0;
+        for (int i = 0; i < ENTRIES_CHECKED; i++) begin
+            if (entries_checked[i].ctrl_signals.memRead &&
+                entries_checked[i].entry_state.valid &&
+                !entries_checked[i].entry_state.dispatched &&
+                !entries_checked[i].entry_state.executed &&
+                entries_checked[i].entry_state.mem_addr_ready) begin
+                perf_load_ready = 1'b1;
+                if (!d_cache_ready) begin
+                    perf_load_blk_dcache = 1'b1;
+                end else begin
+                    for (int j = 0; j < ENTRIES_CHECKED; j++) begin
+                        if (entries_checked[j].entry_state.valid &&
+                            entries_checked[j].ctrl_signals.memWrite &&
+                            is_older(entries_checked[j].id, entries_checked[i].id)) begin
+                            if (~entries_checked[j].entry_state.mem_addr_ready) begin
+                                perf_load_blk_unknown = 1'b1;
+                            end else if (entries_checked[j].result.result_data ==
+                                         dris_entries[entries_checked[i].id.id_index].result.result_data) begin
+                                perf_load_blk_alias = 1'b1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end: perf_load_block_obs
 
     function automatic logic check_older_writes(dris_id_t id);
         // logic to check if there are any older writes in the window that are not yet retired

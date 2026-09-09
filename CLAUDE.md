@@ -56,6 +56,24 @@ structure changes.
 - **VCS is the semantics oracle.** Any RTL/tb change must keep VCS behavior
   identical; 2-state Verilator differences get fixed on the Verilator side
   (or documented). Final blessing = `make regress SIM=vcs` on AFS.
+- **[2026-08-31] Pin VCS to T-2022.06 until further notice.** The AFS default
+  moved to `Foundation-Y/vcs/Y-2026.03-SP1-1`, and **Lightning does not run
+  under it**: 0 cycles, 0 retired, 0 I$ read requests, watchdog timeout, on
+  every test, with two assertions failing at time 0 (`cache_controller2.sv`
+  response-FIFO overflow and `re & we` on the D-side). `CORE=inorder` is
+  unaffected, which is what makes it look like a Lightning bug rather than a
+  harness one. Not a regression: `fcadc38` and every commit back through
+  `cd2508f` behave the same way, and all of them reproduce their documented
+  numbers exactly under T-2022.06 (fibi 18,215 / dhrystone 10,074,367 /
+  fft 6,989,414 / spmv 14,583,805). So it is a latent X-at-reset bug the
+  older VCS happened to tolerate — worth fixing, but until then run:
+
+  ```sh
+  export VCS_HOME=/afs/ece.cmu.edu/support/synopsys/synopsys.release/Foundation-T/vcs/T-2022.06
+  export PATH=$VCS_HOME/bin:$PATH
+  ```
+
+  Any Lightning result showing 0 total cycles is this, not the design.
 - The Verilator binary is a **v5.048 -O1 build** (`VERILATOR` in config.mk);
   stock -O3 builds segfault on this design (GCC 13.3 miscompile).
 - Expected failures today (CORE=lightning, `make regress SIM=vcs` over

@@ -279,6 +279,12 @@ module LightningCore #(
      * computed by an ALU way) plus the store release at retire. Owns
      * the D-side cache seam via the arbiter below.
      * ================================================================= */
+    /* D-side load-admission observation (always driven; consumed only by
+     * the `LTG_PERF counters). Separates a load held up by the blocking
+     * D-cache from one held up by memory ordering. */
+    logic perf_load_ready, perf_load_blk_dcache;
+    logic perf_load_blk_unknown, perf_load_blk_alias;
+
     MemoryScheduler #(
         .TOTAL_PORTS (MEM_ISSUE_WAYS) //right now cache is single ported
     )ms (
@@ -296,7 +302,11 @@ module LightningCore #(
         .rs1_addr           (mem_rs1_addr),
         .rs2_addr           (mem_rs2_addr),
         .rs1_data           (mem_rs1_data),
-        .rs2_data           (mem_rs2_data)
+        .rs2_data           (mem_rs2_data),
+        .perf_load_ready       (perf_load_ready),
+        .perf_load_blk_dcache  (perf_load_blk_dcache),
+        .perf_load_blk_unknown (perf_load_blk_unknown),
+        .perf_load_blk_alias   (perf_load_blk_alias)
     );
 
     // always_ff @(posedge clock) begin
@@ -810,6 +820,21 @@ module LightningCore #(
     int stall_dris_full;        //   ...because the DRIS had no room
     int stall_shelf_full;       //   ...because the branch shelf had none
     int retire_drought_cycles;  // nothing retired at all
+
+    /* ----- Mispredict recovery ------------------------------------------
+     * The redirect itself is one cycle (flush_cycles); the cost is the
+     * refill behind it. `redirect_bubble_cycles` counts cycles from a
+     * mispredict redirect until the front end next lands a group in the
+     * DRIS, which is the drain the predictor's accuracy actually buys or
+     * loses. Divided by mispredict_pulses it is the average penalty. */
+    int redirect_bubble_cycles;
+    logic redirect_recovering;
+
+    // ----- D-side load admission (why a ready load did not issue) -------
+    int load_ready_cycles;      // >=1 load ready to issue
+    int load_blk_dcache;        //   ...D-cache busy (blocking cache)
+    int load_blk_unknown;       //   ...older store's address not yet computed
+    int load_blk_alias;         //   ...older store aliases (no forwarding)
     int flush_cycles;           // a flush mask was live
     int mispredict_pulses;      // mispredict redirects taken
 
@@ -882,6 +907,14 @@ module LightningCore #(
         $display("\t  flush cycles:             %0d", flush_cycles);
         $display("\t  mispredict redirects:     %0d", mispredict_pulses);
         $display("\t  cycles with no retire:    %0d", retire_drought_cycles);
+        $display("\t  redirect refill bubble:   %0d cycles (%0.2f per redirect)",
+                 redirect_bubble_cycles, perf_ratio(redirect_bubble_cycles, mispredict_pulses));
+
+        $display("\t D-side load admission:");
+        $display("\t  cycles a load was ready:  %0d", load_ready_cycles);
+        $display("\t   blocked, D$ busy:        %0d", load_blk_dcache);
+        $display("\t   blocked, older store addr unknown: %0d", load_blk_unknown);
+        $display("\t   blocked, older store aliases:      %0d", load_blk_alias);
 
         $display("\t Non-Control Flow Types (at retirement):");
         $display("\t  ALU:    %0d", ALU_inst_num);
@@ -981,6 +1014,12 @@ module LightningCore #(
             stall_dris_full       <= 0;
             stall_shelf_full      <= 0;
             retire_drought_cycles <= 0;
+            redirect_bubble_cycles <= 0;
+            redirect_recovering    <= 1'b0;
+            load_ready_cycles     <= 0;
+            load_blk_dcache       <= 0;
+            load_blk_unknown      <= 0;
+            load_blk_alias        <= 0;
             flush_cycles          <= 0;
             mispredict_pulses     <= 0;
             branches_resolved     <= 0;
@@ -1016,6 +1055,19 @@ module LightningCore #(
             if (perf_stall_dris_full)  stall_dris_full     <= stall_dris_full     + 1;
             if (perf_stall_shelf_full) stall_shelf_full    <= stall_shelf_full    + 1;
             if (perf_retired_now == 0) retire_drought_cycles <= retire_drought_cycles + 1;
+            /* Enter recovery on the redirect, leave it on the first group the
+             * front end lands after it. A redirect while already recovering
+             * (a second mispredict resolving behind the first) just keeps the
+             * window open rather than starting a new one. */
+            if (perf_mispredict_valid)   redirect_recovering <= 1'b1;
+            else if (perf_issue_fire)    redirect_recovering <= 1'b0;
+            if (redirect_recovering && !perf_issue_fire)
+                redirect_bubble_cycles <= redirect_bubble_cycles + 1;
+
+            if (perf_load_ready)       load_ready_cycles <= load_ready_cycles + 1;
+            if (perf_load_blk_dcache)  load_blk_dcache   <= load_blk_dcache   + 1;
+            if (perf_load_blk_unknown) load_blk_unknown  <= load_blk_unknown  + 1;
+            if (perf_load_blk_alias)   load_blk_alias    <= load_blk_alias    + 1;
             /* flush_vector, not clear_valid: clear_valid is retire | flush,
              * and a retirement is not a flush. */
             if (|flush_vector)         flush_cycles      <= flush_cycles      + 1;
